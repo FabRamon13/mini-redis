@@ -1,5 +1,8 @@
 import sys
-from client import Client
+from pathlib import Path
+
+sys.path.append(str(Path(__file__).resolve().parents[1]))
+from client import Client 
 
 client = Client()
 key = "persistent_name"

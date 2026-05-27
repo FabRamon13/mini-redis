@@ -1,4 +1,4 @@
-import json, sys, time, os, time
+import json, sys, time, os, time, asyncio
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request
 from contextlib import asynccontextmanager 
@@ -26,7 +26,7 @@ async def lifespan(app: FastAPI):
             app.state.cache = Client(host = host, port=port)
             break
         except ConnectionRefusedError:
-            time.sleep(1)
+            await asyncio.sleep(1)
     
     else:
         raise RuntimeError("Could not connect to Redis clone")
@@ -36,6 +36,8 @@ async def lifespan(app: FastAPI):
         "misses": 0,
     }
     yield
+
+    app.state.cache.close()
 
 
 app = FastAPI(lifespan=lifespan)

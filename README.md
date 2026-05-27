@@ -2,9 +2,23 @@
 
 A Redis-inspired TCP key-value store built in Python using sockets and a custom RESP-style protocol parser.
 
-This project was built to understand how backend systems and networked databases work internally, including request parsing, serialization, persistence, expiration logic, and client/server communication.
+This project was built to understand how backend systems and networked databases work internally, including:
+
+- TCP networking
+- request parsing
+- serialization
+- persistence
+- expiration logic
+- concurrent clients
+- containerized backend architecture
+
+The project later evolved into a Dockerized FastAPI caching layer using the Redis clone as backend infrastructure.
+
+---
 
 ## Features
+
+## Core Redis Features
 
 - TCP client/server architecture
 - RESP-style protocol parser and serializer
@@ -14,27 +28,38 @@ This project was built to understand how backend systems and networked databases
 - MGET / MSET
 - EXISTS / TTL
 - TTL expiration with lazy cleanup
-- Append-only file persistence
+- Append-only file (AOF) persistence
 - Concurrent client handling with gevent
-- Thread-safe write/read operations using locks
-- Integration tests for core commands, TTL, persistence, and concurrency
+- Thread-safe shared state using locks
 
+## FastAPI Cache Integration
 
-## Architecture
+- FastAPI cache-aside architecture
+- Dockerized multi-service deployment
+- Cache hit/miss tracking
+- Cache invalidation endpoints
+- Request timing metrics
+- Simulated database latency
 
-Client
+---
+
+## System Architecture
+
+```text
+Browser / Client
 ↓
-RESP Serialization
+FastAPI API Container
 ↓
-TCP Socket
+Redis Clone TCP Cache
 ↓
-Server
+In-Memory Store
 ↓
-Command Dispatch
+AOF Persistence Layer
 ↓
-In-memory Key-Value Store
-↓
-Persistence Layer
+Fake Database
+```
+
+---
 
 ## Request Lifecycle
 
@@ -44,6 +69,8 @@ Persistence Layer
 4. Command dispatcher executes the appropriate method
 5. Server serializes the response
 6. Client parses the response back into Python values
+
+---
 
 ## Example Commands
 
@@ -56,11 +83,11 @@ client.ttl("temp")
 
 client.mset("k1", "v1", "k2", "v2")
 client.mget("k1", "k2")
+```
+
+---
 
 
-# TTL Notes
-
-```md
 ## TTL Expiration
 
 TTL support was implemented using lazy expiration.
@@ -72,11 +99,13 @@ Expiration timestamps are stored separately from values:
 
 Expired keys are removed when accessed.
 
+---
+
 ## Persistence
 
 The server uses an append-only file (AOF) persistence model.
 
-Write operations are appended to disk and replayed on server startup to rebuild in-memory state.
+Write operations are serialized using the RESP protocol and replayed on server startup to rebuild in-memory state.
 
 This introduces concepts similar to:
 
@@ -84,21 +113,61 @@ This introduces concepts similar to:
 - Event sourcing
 - Redis AOF persistence
 
-## Current Limitations
+---
 
-- Persistence format is simplified and space-delimited
+# Dockerized Deployment
+
+Run the full system:
+
+```bash
+docker compose up --build
+```
+
+Services:
+
+- FastAPI API container
+- Redis clone container
+
+FastAPI runs on:
+
+```text
+http://127.0.0.1:8000
+```
+
+---
+
+# Tests
+
+Integration tests cover:
+
+- SET / GET
+- overwrite behavior
+- missing keys
+- MSET / MGET
+- TTL expiration
+- AOF persistence
+- concurrent clients
+
+---
+
+# Current Limitations
+
+- No active background expiration sweeps
 - No AOF compaction/rewrite
-- No background expiration sweeps
-- Nested values are not safely persisted
-- No authentication or replication
+- No replication or clustering
+- No snapshotting
+- TTL replay after restart resets expiration duration
+- Limited RESP compatibility compared to real Redis
 
-## Future Improvements
+---
 
-- EXISTS / TTL command expansion
-- Active expiration sweeps
-- Improved RESP-compliant persistence
-- Async worker queue integration
-- FastAPI cache integration
-- Snapshotting and AOF compaction
-- Docker deployment
+# Future Improvements 
 
+- Background expiration worker
+- AOF rewrite/compaction
+- Snapshot persistence
+- Distributed worker queue
+- Async task processing
+- Metrics/observability dashboard
+- Kubernetes deployment
+- AI inference caching integration

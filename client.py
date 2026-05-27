@@ -23,6 +23,12 @@ class Client:
             raise CommandError(response.message)
 
         return response
+    """
+    method to close socket
+    """
+    def close(self):
+        self._fh.close()
+        self._socket.close()
 
     def get(self, key):
         return self.execute("GET", key)
