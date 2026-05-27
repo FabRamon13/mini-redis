@@ -6,15 +6,18 @@ This project was built to understand how backend systems and networked databases
 
 ## Features
 
-- TCP socket-based client/server architecture
-- RESP-style protocol parsing and serialization
-- GET / SET / DELETE / FLUSH commands
-- MGET / MSET support
-- PING / PONG health checks
-- TTL expiration with lazy invalidation
-- Append-only file persistence (AOF)
-- Concurrent client handling using gevent
-- Integration tests for core functionality
+- TCP client/server architecture
+- RESP-style protocol parser and serializer
+- Command dispatch layer
+- In-memory key-value storage
+- PING / GET / SET / DELETE / FLUSH
+- MGET / MSET
+- EXISTS / TTL
+- TTL expiration with lazy cleanup
+- Append-only file persistence
+- Concurrent client handling with gevent
+- Thread-safe write/read operations using locks
+- Integration tests for core commands, TTL, persistence, and concurrency
 
 
 ## Architecture
@@ -98,3 +101,4 @@ This introduces concepts similar to:
 - FastAPI cache integration
 - Snapshotting and AOF compaction
 - Docker deployment
+

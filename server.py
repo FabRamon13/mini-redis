@@ -1,8 +1,7 @@
 from gevent.pool import Pool
 from gevent.server import StreamServer
-import time 
-import os 
-
+import time, os
+from threading import Lock, RLock
 from exceptions import CommandError, Disconnect
 from protocol import ProtocolHandler, Error
 
@@ -16,6 +15,7 @@ class Server:
 
     """
     def __init__(self, host="127.0.0.1", port=31337, max_clients=64):
+        self._lock = RLock()
         self._pool = Pool(max_clients)
 
         ##connected to TCP port 31337
@@ -126,89 +126,118 @@ class Server:
             b"EXISTS": self.exists,
             b"TTL": self.ttl,
         }
-    def get(self, key):
-        if self._is_expired(key):
-            return None
+    def get(self, *args):
+        self._require_args("GET", args,1)
+
+        key = args[0]
         
-        return self._kv.get(key)
+        with self._lock:
 
-    def set(self, key, value, *options):
-        self._kv[key] = value
-
-        if options:
-            if len(options) != 2:
-                raise CommandError("SET options must be EX seconds")
+            if self._is_expired(key):
+                return None
             
-            option, seconds = options
+            return self._kv.get(key)
 
-            if option.upper() != b"EX":
-                raise CommandError("Only EX option is supported")
+    def set(self, *args):
+        self._require_min_args("SET", args, 2)
 
-            self._expiry[key] = time.time() + float(seconds)
+        key = args[0]
+        value = args[1]
+        options = args[2:]
 
-        else:
-            self._expiry.pop(key, None)
         
-        self._append_to_aof([b"SET", key, value] + list(options))
+        with self._lock:
+            self._kv[key] = value
+
+            if options:
+                if len(options) != 2:
+                    raise CommandError("SET options must be EX seconds")
+                
+                option, seconds = options
+
+                if option.upper() != b"EX":
+                    raise CommandError("Only EX option is supported")
+
+                self._expiry[key] = time.time() + float(seconds)
+
+            else:
+                self._expiry.pop(key, None)
+            
+            self._append_to_aof([b"SET", key, value] + list(options))
 
         return 1
 
-    def delete(self, key):
-        if self._is_expired(key):
-            return 0
+    def delete(self, *args):
+        self._require_args("DELETE", args, 1)
+        key = args[0]
         
-        if key in self._kv:
-            del self._kv[key]
-            self._expiry.pop(key, None)
-            self._append_to_aof([b"DELETE", key])
-            return 1
-        
+        with self._lock:
+            if self._is_expired(key):
+                return 0
+            if key in self._kv:
+                del self._kv[key]
+                self._expiry.pop(key, None)
+                self._append_to_aof([b"DELETE", key])
+                return 1
+            
         return 0
 
     def flush(self):
-        self._append_to_aof([b"FLUSH"])
-        kvlen = len(self._kv)
-        self._kv.clear()
-        self._expiry.clear()
-        return kvlen
+        with self._lock:
+            self._append_to_aof([b"FLUSH"])
+            kvlen = len(self._kv)
+            self._kv.clear()
+            self._expiry.clear()
+            return kvlen
 
     def mget(self, *keys):
-        
-        return [self.get(key) for key in keys]
+        with self._lock:
+            self._require_min_args("MGET", keys, 1)
+            return [self.get(key) for key in keys]
 
     def mset(self, *items):
+        self._require_min_args("MSET",items,2)
+
         if len(items) %2 != 0:
             raise CommandError("MSET requires k/v pairs")
         
         data = list(zip(items[::2], items[1::2]))
+        with self._lock:
+            for k,v in data:
+                self._kv[k] = v
+                self._expiry.pop(k, None)
 
-        for k,v in data:
-            self._kv[k] = v
-            self._expiry.pop(k, None)
-
-        self._append_to_aof([b"MSET"] + list(items))
-        
-        return len(data)
+            self._append_to_aof([b"MSET"] + list(items))
+            
+            return len(data)
     
     def ping(self):
         return b"PONG"
 
-    def exists(self,key):
-        if self._is_expired(key):
-            return 0 
-        return 1 if key in self._kv else 0
-    
-    def ttl(self,key):
-        if self._is_expired(key):
-            return -2 ##key doesnt exists 
-        
-        if key not in self._kv:
-            return -2
+    def exists(self,*args):
+        self._require_args("EXISTS", args, 1)
+        key = args[0]
 
-        if key not in self._expiry:
-            return -1
+        with self._lock:
+            if self._is_expired(key):
+                return 0 
+            return 1 if key in self._kv else 0
     
-        return int(self._expiry[key] - time.time())
+    def ttl(self,*args):
+        self._require_args("TTL", args,1)
+        key = args[0]
+        
+        with self._lock:
+            if self._is_expired(key):
+                return -2 ##key doesnt exists 
+            
+            if key not in self._kv:
+                return -2
+
+            if key not in self._expiry:
+                return -1
+        
+            return int(self._expiry[key] - time.time())
     
     
     """
@@ -231,6 +260,17 @@ class Server:
         
         return False
     
+    """
+    helper functions to help with command validation 
+    """
+    def _require_args(self,command, args,expected):
+        if len(args) != expected:
+            raise CommandError(f"{command} requires {expected} argument(s)")
+        
+    
+    def _require_min_args(self, command, args, minimum):
+        if len(args) < minimum:
+            raise CommandError(f"{command} requires at least {minimum} argument(s)")
 
     def run(self):
         self._server.serve_forever()
