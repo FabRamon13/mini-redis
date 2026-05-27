@@ -1,6 +1,6 @@
-from gevent import socket, monkey
-from server import ProtocolHandler, CommandError, Error, Server
-
+from gevent import socket
+from exceptions import CommandError
+from protocol import ProtocolHandler, Error
 
 class Client:
     def __init__(self, host="127.0.0.1", port=31337):
@@ -24,8 +24,8 @@ class Client:
     def get(self, key):
         return self.execute("GET", key)
 
-    def set(self, key, value):
-        return self.execute("SET", key, value)
+    def set(self, key, value, *options):
+        return self.execute("SET", key, value, *options)
 
     def delete(self, key):
         return self.execute("DELETE", key)
@@ -38,8 +38,10 @@ class Client:
 
     def mset(self, *items):
         return self.execute("MSET", *items)
+    def ping(self):
+        return self.execute("PING")
     
-if __name__ == "__main__":
-    monkey.patch_all()
-
-    Server().run()
+    def exists(self,key):
+        return self.execute("EXISTS", key)
+    def ttl(self,key):
+        return self.execute("TTL",key)

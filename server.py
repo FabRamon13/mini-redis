@@ -1,133 +1,12 @@
 from gevent.pool import Pool
 from gevent.server import StreamServer
+import time 
+import os 
 
-from io import BytesIO
-from collections import namedtuple
+from exceptions import CommandError, Disconnect
+from protocol import ProtocolHandler, Error
 
-
-class CommandError(Exception):
-    pass
-
-
-class Disconnect(Exception):
-    pass
-
-
-Error = namedtuple("Error", ("message",))
-
-
-class ProtocolHandler:
-    def __init__(self):
-        ## Map of Redis protocol type indicators to their corresponding handler methods
-        self.handlers = {
-            b"+": self.handle_simple_string,
-            b"-": self.handle_error,
-            b":": self.handle_integer,
-            b"$": self.handle_string,
-            b"*": self.handle_array,
-            b"%": self.handle_dict,
-        }
-    def handle_request(self, socket_file):
-        first_byte = socket_file.read(1)
-
-        if not first_byte:
-            raise Disconnect()
-        
-        try:
-            return self.handlers[first_byte](socket_file)
-        except KeyError:
-            raise CommandError(f"Unknown protocol type: {first_byte}")  
     
-    ##parse to handle simple strings 
-    def handle_simple_string(self, socket_file):
-        return socket_file.readline().rstrip(b"\r\n")
-
-    ##handling errors 
-    def handle_error(self, socket_file):
-        return Error(socket_file.readline().rstrip(b"\r\n"))
-
-    ##handling integers 
-    def handle_integer(self, socket_file):
-        return int(socket_file.readline().rstrip(b"\r\n"))
-
-    def handle_string(self, socket_file):
-        length = int(socket_file.readline().rstrip(b"\r\n"))
-
-        if length == -1:
-            return None
-
-        length += 2
-        return socket_file.read(length)[:-2]
-
-    def handle_array(self, socket_file):
-        num_elements = int(socket_file.readline().rstrip(b"\r\n"))
-
-        return [
-            self.handle_request(socket_file)
-            for _ in range(num_elements)
-        ]
-
-    def handle_dict(self, socket_file):
-        num_items = int(socket_file.readline().rstrip(b"\r\n"))
-
-        elements = [
-            self.handle_request(socket_file)
-            for _ in range(num_items * 2)
-        ]
-
-        return dict(zip(elements[::2], elements[1::2]))
-
-    def write_response(self, socket_file, data):
-    
-        buf = BytesIO()
-        self._write(buf, data)
-        socket_file.write(buf.getvalue())
-        socket_file.flush()
-
-    def _write(self, buf, data):
-        if isinstance(data, str):
-            data = data.encode("utf-8")
-
-        if isinstance(data, bytes):
-            buf.write(
-                b"$" + str(len(data)).encode("utf-8") +
-                b"\r\n" + data + b"\r\n"
-            )
-
-        elif isinstance(data, int):
-            buf.write(
-                b":" + str(data).encode("utf-8") + b"\r\n"
-            )
-
-        elif isinstance(data, Error):
-            message = data.message
-            if isinstance(message, str):
-                message = message.encode("utf-8")
-
-            buf.write(b"-" + message + b"\r\n")
-
-        elif isinstance(data, (list, tuple)):
-            buf.write(
-                b"*" + str(len(data)).encode("utf-8") + b"\r\n"
-            )
-
-            for item in data:
-                self._write(buf, item)
-
-        elif isinstance(data, dict):
-            buf.write(
-                b"%" + str(len(data)).encode("utf-8") + b"\r\n"
-            )
-
-            for key, value in data.items():
-                self._write(buf, key)
-                self._write(buf, value)
-
-        elif data is None:
-            buf.write(b"$-1\r\n")
-
-        else:
-            raise CommandError(f"unrecognized type: {type(data)}")
 
 
 class Server:
@@ -150,7 +29,52 @@ class Server:
         self._protocol = ProtocolHandler()
         ##this is the redis db
         self._kv = {}
+        ##this is the expiry time for keys
+        ## [key] => expiry_time
+        self._expiry = {}
         self._commands = self.get_commands()
+        self._loading = False
+        self._aof_file = "appendonly.aof"
+        self.load_persistence()
+
+   
+    """
+    Return the append-only file for logging commands.
+    """
+    def load_persistence(self):
+        if not os.path.exists(self._aof_file):
+            return
+        
+        self._loading = True
+
+        try:
+            with open(self._aof_file, "rb") as f:
+                for line in f:
+                    parts = line.strip().split(b" ")
+
+                    if not parts:
+                        continue 
+
+                    command = parts[0].upper()
+
+                    if command in self._commands:
+                        self._commands[command](*parts[1:])
+        finally:
+            self._loading = False 
+
+
+    """
+    Append a command to the append-only file.
+    """
+    def _append_to_aof(self, command_parts, *args):
+        if self._loading:
+            return 
+        
+        with open(self._aof_file, "ab") as f:
+            line = b" ".join(command_parts) + b"\n"
+            f.write(line)
+
+
     """
     Handle a new connection from a client.
 
@@ -197,40 +121,120 @@ class Server:
             b"DELETE": self.delete,
             b"FLUSH": self.flush,
             b"MGET": self.mget,
-            b"MSET": self.mset
+            b"MSET": self.mset,
+            b"PING": self.ping,
+            b"EXISTS": self.exists,
+            b"TTL": self.ttl,
         }
     def get(self, key):
+        if self._is_expired(key):
+            return None
+        
         return self._kv.get(key)
 
-    def set(self, key, value):
+    def set(self, key, value, *options):
         self._kv[key] = value
+
+        if options:
+            if len(options) != 2:
+                raise CommandError("SET options must be EX seconds")
+            
+            option, seconds = options
+
+            if option.upper() != b"EX":
+                raise CommandError("Only EX option is supported")
+
+            self._expiry[key] = time.time() + float(seconds)
+
+        else:
+            self._expiry.pop(key, None)
+        
+        self._append_to_aof([b"SET", key, value] + list(options))
+
         return 1
 
     def delete(self, key):
+        if self._is_expired(key):
+            return 0
+        
         if key in self._kv:
             del self._kv[key]
+            self._expiry.pop(key, None)
+            self._append_to_aof([b"DELETE", key])
             return 1
+        
         return 0
 
     def flush(self):
+        self._append_to_aof([b"FLUSH"])
         kvlen = len(self._kv)
         self._kv.clear()
+        self._expiry.clear()
         return kvlen
 
     def mget(self, *keys):
-        return [self._kv.get(key) for key in keys]
+        
+        return [self.get(key) for key in keys]
 
     def mset(self, *items):
+        if len(items) %2 != 0:
+            raise CommandError("MSET requires k/v pairs")
+        
         data = list(zip(items[::2], items[1::2]))
 
-        for key, value in data:
-            self._kv[key] = value
+        for k,v in data:
+            self._kv[k] = v
+            self._expiry.pop(k, None)
 
+        self._append_to_aof([b"MSET"] + list(items))
+        
         return len(data)
+    
+    def ping(self):
+        return b"PONG"
+
+    def exists(self,key):
+        if self._is_expired(key):
+            return 0 
+        return 1 if key in self._kv else 0
+    
+    def ttl(self,key):
+        if self._is_expired(key):
+            return -2 ##key doesnt exists 
+        
+        if key not in self._kv:
+            return -2
+
+        if key not in self._expiry:
+            return -1
+    
+        return int(self._expiry[key] - time.time())
+    
+    
+    """
+    helper method to verify expiration
+    verifies current time, extracts expiry time 
+    if the key has expired, it removes the key from 
+    both the key-value store and the expiry dictionary
+    Lazy Expiration
+    """
+    def _is_expired(self, key):
+        expires_at = self._expiry.get(key)
+
+        if expires_at is None:
+            return False
+
+        if time.time() > expires_at:
+            self._kv.pop(key, None)
+            self._expiry.pop(key, None)
+            return True
+        
+        return False
+    
 
     def run(self):
         self._server.serve_forever()
-
+ 
 
 if __name__ == "__main__":
     server = Server()
