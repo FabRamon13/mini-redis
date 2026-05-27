@@ -1,0 +1,22 @@
+services:
+  redis_clone:
+    build:
+      context: .
+      dockerfile: Dockerfile.redis
+    ports:
+      - "31337:31337"
+    environment:
+      REDIS_BIND_HOST: 0.0.0.0
+      REDIS_PORT: 31337
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    ports:
+      - "8000:8000"
+    depends_on:
+      - redis_clone
+    environment:
+      REDIS_HOST: redis_clone
+      REDIS_PORT: 31337

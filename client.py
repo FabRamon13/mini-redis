@@ -1,4 +1,4 @@
-from gevent import socket
+import socket
 from exceptions import CommandError
 from protocol import ProtocolHandler, Error
 
@@ -11,6 +11,9 @@ class Client:
 
         self._fh = self._socket.makefile("rwb")
 
+    """
+    sends out commands 
+    """
     def execute(self, *args):
         self._protocol.write_response(self._fh, args)
 

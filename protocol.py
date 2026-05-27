@@ -27,7 +27,60 @@ class ProtocolHandler:
         try:
             return self.handlers[first_byte](socket_file)
         except KeyError:
-            raise CommandError(f"Unknown protocol type: {first_byte}")  
+            raise CommandError(f"Unknown protocol type: {first_byte}") 
+
+    def write_response(self, socket_file, data):
+    
+        buf = BytesIO()
+        self._write(buf, data)
+        socket_file.write(buf.getvalue())
+        ##sends through TCP conn
+        socket_file.flush()
+        
+    def _write(self, buf, data):
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+
+        if isinstance(data, bytes):
+            buf.write(
+                b"$" + str(len(data)).encode("utf-8") +
+                b"\r\n" + data + b"\r\n"
+            )
+
+        elif isinstance(data, int):
+            buf.write(
+                b":" + str(data).encode("utf-8") + b"\r\n"
+            )
+
+        elif isinstance(data, Error):
+            message = data.message
+            if isinstance(message, str):
+                message = message.encode("utf-8")
+
+            buf.write(b"-" + message + b"\r\n")
+
+        elif isinstance(data, (list, tuple)):
+            buf.write(
+                b"*" + str(len(data)).encode("utf-8") + b"\r\n"
+            )
+
+            for item in data:
+                self._write(buf, item)
+
+        elif isinstance(data, dict):
+            buf.write(
+                b"%" + str(len(data)).encode("utf-8") + b"\r\n"
+            )
+
+            for key, value in data.items():
+                self._write(buf, key)
+                self._write(buf, value)
+
+        elif data is None:
+            buf.write(b"$-1\r\n")
+
+        else:
+            raise CommandError(f"unrecognized type: {type(data)}")
     
     ##parse to handle simple strings 
     def handle_simple_string(self, socket_file):
@@ -67,13 +120,6 @@ class ProtocolHandler:
         ]
 
         return dict(zip(elements[::2], elements[1::2]))
-
-    def write_response(self, socket_file, data):
-    
-        buf = BytesIO()
-        self._write(buf, data)
-        socket_file.write(buf.getvalue())
-        socket_file.flush()
 
     def _write(self, buf, data):
         if isinstance(data, str):

@@ -14,7 +14,7 @@ class Server:
     Pool allows users to connect simultaneously (max_clients)
 
     """
-    def __init__(self, host="127.0.0.1", port=31337, max_clients=64):
+    def __init__(self, host="127.0.0.1", port=31337, max_clients=64, aof_file="appendonly.aof"):
         self._lock = RLock()
         self._pool = Pool(max_clients)
 
@@ -34,45 +34,8 @@ class Server:
         self._expiry = {}
         self._commands = self.get_commands()
         self._loading = False
-        self._aof_file = "appendonly.aof"
+        self._aof_file = aof_file
         self.load_persistence()
-
-   
-    """
-    Return the append-only file for logging commands.
-    """
-    def load_persistence(self):
-        if not os.path.exists(self._aof_file):
-            return
-        
-        self._loading = True
-
-        try:
-            with open(self._aof_file, "rb") as f:
-                for line in f:
-                    parts = line.strip().split(b" ")
-
-                    if not parts:
-                        continue 
-
-                    command = parts[0].upper()
-
-                    if command in self._commands:
-                        self._commands[command](*parts[1:])
-        finally:
-            self._loading = False 
-
-
-    """
-    Append a command to the append-only file.
-    """
-    def _append_to_aof(self, command_parts, *args):
-        if self._loading:
-            return 
-        
-        with open(self._aof_file, "ab") as f:
-            line = b" ".join(command_parts) + b"\n"
-            f.write(line)
 
 
     """
@@ -272,10 +235,46 @@ class Server:
         if len(args) < minimum:
             raise CommandError(f"{command} requires at least {minimum} argument(s)")
 
+    """
+    Return the append-only file for logging commands.
+    """
+    def load_persistence(self):
+        if not os.path.exists(self._aof_file):
+            return
+        
+        self._loading = True
+
+        try:
+            with open(self._aof_file, "rb") as f:
+                while True:
+                    try:
+                        data = self._protocol.handle_request(f)
+                    except Disconnect:
+                        break
+
+                    self.get_response(data)
+        finally:
+            self._loading = False 
+
+
+    """
+    Append a command to the append-only file.
+    """
+    def _append_to_aof(self, command_parts):
+        if self._loading:
+            return 
+        
+        with open(self._aof_file, "ab") as f:
+            self._protocol.write_response(f, command_parts)
+
+    
     def run(self):
         self._server.serve_forever()
  
 
 if __name__ == "__main__":
-    server = Server()
+    host = os.getenv("REDIS_BIND_HOST", "127.0.0.1")
+    port = int(os.getenv("REDIS_PORT", "31337"))
+
+    server = Server(host = host, port = port)
     server.run()
