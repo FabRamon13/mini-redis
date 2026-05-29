@@ -2,3 +2,6 @@ fastapi
 uvicorn
 gevent
 pydantic
+watchfiles
+pydantic-settings
+requests

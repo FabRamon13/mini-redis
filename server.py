@@ -275,6 +275,7 @@ class Server:
 if __name__ == "__main__":
     host = os.getenv("REDIS_BIND_HOST", "127.0.0.1")
     port = int(os.getenv("REDIS_PORT", "31337"))
+    aof_file = os.getenv("AOF_FILE", "appendonly.aof")
 
-    server = Server(host = host, port = port)
+    server = Server(host = host, port = port, aof_file = aof_file)
     server.run()

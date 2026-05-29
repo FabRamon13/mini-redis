@@ -8,6 +8,11 @@ services:
     environment:
       REDIS_BIND_HOST: 0.0.0.0
       REDIS_PORT: 31337
+      AOF_FILE: /app/data/appendonly.aof
+    volumes:
+      - .:/app
+      - redis_data:/app/data
+    command: sh -c "watchfiles --filter python 'python server.py' ."
 
   api:
     build:
@@ -20,3 +25,9 @@ services:
     environment:
       REDIS_HOST: redis_clone
       REDIS_PORT: 31337
+    volumes:
+      - .:/app
+    command: ["uvicorn", "fastapi_cache.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+
+volumes:
+  redis_data:

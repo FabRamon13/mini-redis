@@ -1,15 +1,30 @@
-import json, sys, time, os, time, asyncio
+import json
+import sys
+import time
+import os 
+import asyncio
+import uuid
+import logging
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request
 from contextlib import asynccontextmanager 
 from pydantic import BaseModel
-
-
-
 sys.path.append(str(Path(__file__).resolve().parents[1]))
-
 from client import Client
 from fastapi_cache.fake_db import FAKE_DB
+from fastapi_cache.config import Settings
+
+settings = Settings()
+
+
+
+
+logging.basicConfig(
+    level = logging.INFO,
+    format = "%(message)s"
+)
+
+logger = logging.getLogger("fastapi_cache")
 
 class UserUpdate(BaseModel):
     name:str
@@ -18,8 +33,8 @@ class UserUpdate(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    host = os.getenv("REDIS_HOST", "127.0.0.1")
-    port = int(os.getenv("REDIS_PORT", "31337"))
+    host = settings.redis_host
+    port = settings.redis_port
     
     for attempt in range(10):
         try: 
@@ -41,6 +56,28 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+@app.middleware("http")
+async def request_logging_middleware(request: Request, call_next):
+    request_id = str(uuid.uuid4())
+    start = time.perf_counter()
+
+    response = await call_next(request)
+
+    latency_ms = round((time.perf_counter() - start) * 1000, 2)
+
+    logger.info(json.dumps({
+        "request_id": request_id,
+        "method": request.method,
+        "path": request.url.path,
+        "status_code": response.status_code,
+        "latency_ms": latency_ms,
+        "client_host": request.client.host if request.client else None,
+    }))
+
+    response.headers["X-Request-ID"] = request_id
+
+    return response
 
 @app.put("/users/{user_id}")
 def update_user(user_id: str, updated_user: UserUpdate, request:Request):
@@ -89,7 +126,7 @@ def get_user(user_id: str, request: Request):
     if user is None:
         raise HTTPException(status_code=404, detail="User not found")
     
-    cache.set(cache_key, json.dumps(user), "EX", "30")
+    cache.set(cache_key, json.dumps(user), "EX", str(settings.cache_ttl))
     duration_ms = round((time.perf_counter() - start) *1000,2)
 
     return {
@@ -119,4 +156,23 @@ def invalidate_user_cache(user_id: str, request: Request):
     return {
         "cache_key": cache_key,
         "deleted": bool(deleted),
+    }
+
+@app.get("/health")
+def health_check(request:Request):
+    cache = request.app.state.cache
+
+    try:
+        pong = cache.ping()
+        cache_status = "healthy" if pong == b"PONG" else "unhealthy"
+    
+    except Exception:
+        cache_status = "unhealthy"
+
+    overall_status = "healthy" if cache_status == "healthy" else "degraded"
+    
+    return {
+        "status": overall_status,
+        "api": "healthy",
+        "cache": cache_status,
     }

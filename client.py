@@ -27,8 +27,10 @@ class Client:
     method to close socket
     """
     def close(self):
-        self._fh.close()
-        self._socket.close()
+        try:
+            self._fh.close()
+        finally:
+            self._socket.close()
 
     def get(self, key):
         return self.execute("GET", key)
