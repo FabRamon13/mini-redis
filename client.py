@@ -56,3 +56,10 @@ class Client:
         return self.execute("EXISTS", key)
     def ttl(self,key):
         return self.execute("TTL",key)
+    def lpush(self,key,*values):
+        return self.execute("LPUSH", key, *values)
+    def rpop(self, key):
+        return self.execute("RPOP", key)
+
+    def llen(self, key):
+        return self.execute("LLEN", key)

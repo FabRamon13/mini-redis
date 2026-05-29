@@ -5,6 +5,7 @@ class Settings(BaseSettings):
     redis_port: int = 31337
     cache_ttl: int = 30
     app_name: str = "FastAPI Cache Demo"
+    max_queue_size: int =100
 
 
     class Config:

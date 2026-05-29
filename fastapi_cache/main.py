@@ -1,10 +1,11 @@
 import json
 import sys
 import time
-import os 
 import asyncio
 import uuid
 import logging
+
+from datetime import datetime, timezone
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request
 from contextlib import asynccontextmanager 
@@ -14,6 +15,7 @@ from client import Client
 from fastapi_cache.fake_db import FAKE_DB
 from fastapi_cache.config import Settings
 
+# Load runtime configuration from environment-backed settings.
 settings = Settings()
 
 
@@ -33,10 +35,21 @@ class UserUpdate(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """
+    Initialize shared application resources on startup and clean them up
+    during shutdown.
+
+    The API owns one Redis-clone client connection for cache and queue
+    operations, stored on app.state for route-level access.
+    """
+
     host = settings.redis_host
     port = settings.redis_port
     
     for attempt in range(10):
+        # Retry because Docker Compose may start the API before the Redis clone
+        # is ready to accept TCP connections.
+
         try: 
             app.state.cache = Client(host = host, port=port)
             break
@@ -59,6 +72,13 @@ app = FastAPI(lifespan=lifespan)
 
 @app.middleware("http")
 async def request_logging_middleware(request: Request, call_next):
+    """
+    Add request-level observability around every HTTP request.
+
+    Generates a correlation ID, measures end-to-end request latency,
+    emits structured JSON logs, and returns the request ID to clients.
+    """
+    
     request_id = str(uuid.uuid4())
     start = time.perf_counter()
 
@@ -81,6 +101,13 @@ async def request_logging_middleware(request: Request, call_next):
 
 @app.put("/users/{user_id}")
 def update_user(user_id: str, updated_user: UserUpdate, request:Request):
+    """
+    Update the backing datastore and invalidate the cached user record.
+
+    This preserves cache-aside correctness by ensuring future reads
+    fetch fresh data from the database path.
+    """
+    
     cache = request.app.state.cache 
 
     if user_id not in FAKE_DB:
@@ -103,6 +130,13 @@ def update_user(user_id: str, updated_user: UserUpdate, request:Request):
 
 @app.get("/users/{user_id}")
 def get_user(user_id: str, request: Request):
+    """
+    Read user data through a cache-aside pattern.
+
+    The API checks cache first, falls back to the backing datastore on
+    misses, then stores the result with a TTL for future requests.
+    """
+
     start = time.perf_counter()
     cache = request.app.state.cache
     stats = request.app.state.stats
@@ -135,17 +169,25 @@ def get_user(user_id: str, request: Request):
         "data": user,
     }
 
-"""
-getting stats from hit or miss cache 
-"""
+
 @app.get("/cache/stats")
 def cache_stats(request: Request):
+    """
+    Return process local cach hit/miss metrics for basic observability
+    """
     stats = request.app.state.stats
     time.sleep(1)
     return stats
 
 @app.delete("/cache/users/{user_id}")
 def invalidate_user_cache(user_id: str, request: Request):
+    """
+    Manually remove a user cache entry.
+
+    Useful for testing cache invalidation and simulating explicit
+    administrative cache eviction.
+    """
+    
     cache = request.app.state.cache
     
     cache_key = f"user:{user_id}"
@@ -160,6 +202,13 @@ def invalidate_user_cache(user_id: str, request: Request):
 
 @app.get("/health")
 def health_check(request:Request):
+    """
+    Report API health and dependency health.
+
+    The API is considered alive if this route can execute. The overall
+    status is degraded when the Redis clone dependency is unavailable.
+    """
+
     cache = request.app.state.cache
 
     try:
@@ -176,3 +225,86 @@ def health_check(request:Request):
         "api": "healthy",
         "cache": cache_status,
     }
+
+@app.post("/jobs")
+def create_job(request:Request):
+    """
+    Submit a job into the Redis-backed queue.
+
+    The API acts as the producer: it creates job metadata, stores initial
+    job state, and enqueues the job ID for a separate worker process.
+    """
+    queue_size = cache.llen("jobs")
+
+    if queue_size >= settings.max_queue_size:
+        raise HTTPException(
+            status_code=429,
+            detail="Queue is full. retry later."
+        )
+    
+    cache = request.app.state.cache
+
+    job_id = str(uuid.uuid4())
+    job_key = f"job:{job_id}"
+
+    job_data = {
+        "id": job_id,
+        "status": "queued",
+        "type": "demo_task",
+        "created_at": now_iso(),
+        "started_at":None,
+        "completed_at": None,
+        "failed_at": None,
+        "error": None,
+        "result": None,
+        "attempts": 0,
+        "max_attempts": 3,
+    }
+
+    cache.set(job_key, json.dumps(job_data))
+    cache.lpush("jobs", job_id)
+
+    return {
+        "job_id": job_id,
+        "status": "queued",
+    }
+
+@app.get("/jobs/metrics")
+def get_job_metrics(request: Request):
+    cache = request.app.state.cache
+    processed = cache.get("metrics:processed_jobs")
+    failed = cache.get("metrics:failed_jobs")
+
+    return {
+        "queued_jobs": cache.llen("jobs"),
+        "dead_jobs": cache.llen("dead_jobs"),
+        "processed_jobs": int(processed.decode("utf-8")) if processed else 0,
+        "failed_jobs": int(failed.decode("utf-8")) if failed else 0,
+        "max_queue_size": settings.max_queue_size,
+    }
+
+@app.get("/jobs/{job_id}")
+def get_job(job_id: str, request: Request):
+    cache = request.app.state.cache
+
+    job_key = f"job:{job_id}"
+    job = cache.get(job_key)
+
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    return json.loads(job.decode("utf-8"))
+
+@app.get("/jobs/dead/count")
+def get_dead_jobs_count(request: Request):
+    cache = request.app.state.cache
+
+    return {
+        "dead_jobs": cache.llen("dead_jobs")
+    }
+
+
+
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()

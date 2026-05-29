@@ -10,16 +10,23 @@ from protocol import ProtocolHandler, Error
 
 class Server:
     """
-    infrastructure is created here 
-    Pool allows users to connect simultaneously (max_clients)
+    TCP server, implements:
 
+    RESP command parsing
+    concurrent client handling
+    in memory data storage
+    TTL expiration
+    Append only file persistence
     """
     def __init__(self, host="127.0.0.1", port=31337, max_clients=64, aof_file="appendonly.aof"):
+        #protects shared state across concurrent clients 
         self._lock = RLock()
+
+        #limits # of active client connected simultaneously
         self._pool = Pool(max_clients)
 
-        ##connected to TCP port 31337
-        # listen for connection once connceted call connection handler 
+        #TCP server responsible for accepting connections 
+        ##dispatches requests to connection handler 
         self._server = StreamServer(
             (host, port),
             self.connection_handler,
@@ -27,22 +34,34 @@ class Server:
         )
 
         self._protocol = ProtocolHandler()
-        ##this is the redis db
+        
+        ##primary in memory k/v store
         self._kv = {}
-        ##this is the expiry time for keys
-        ## [key] => expiry_time
+
+        ##tracks key expiration timestamps
         self._expiry = {}
+
+        #redis style list storage for queue operations
+        self._lists = {}
+
         self._commands = self.get_commands()
+
+        #prevents AOF writes while replaying persistent data
         self._loading = False
+
         self._aof_file = aof_file
+
+        #restore state from AOF log
         self.load_persistence()
 
 
-    """
-    Handle a new connection from a client.
-
-    """
+    
     def connection_handler(self, conn, address):
+        """
+        Process commands over a persistent client connection until
+        the client disconnects
+
+        """
         socket_file = conn.makefile("rwb")
 
         while True:
@@ -59,7 +78,10 @@ class Server:
             self._protocol.write_response(socket_file, response)
 
     def get_response(self, data):
-        ##validation 
+        """
+        Validate incoming requests and dispatch them to the
+        appropriate command handler.
+        """
         if not isinstance(data, list):
             try:
                 data = data.split()
@@ -88,6 +110,9 @@ class Server:
             b"PING": self.ping,
             b"EXISTS": self.exists,
             b"TTL": self.ttl,
+            b"LPUSH": self.lpush,
+            b"RPOP": self.rpop,
+            b"LLEN": self.llen,
         }
     def get(self, *args):
         self._require_args("GET", args,1)
@@ -110,6 +135,9 @@ class Server:
 
         
         with self._lock:
+            # Mutating operations are synchronized to maintain consistency
+            # across concurrent client requests.
+
             self._kv[key] = value
 
             if options:
@@ -126,6 +154,7 @@ class Server:
             else:
                 self._expiry.pop(key, None)
             
+            #Persist the mutation for crash recovery
             self._append_to_aof([b"SET", key, value] + list(options))
 
         return 1
@@ -201,16 +230,69 @@ class Server:
                 return -1
         
             return int(self._expiry[key] - time.time())
+        
+    def lpush(self, *args):
+        """
+        Insert one or more values at the head of list.
+
+        Support Redis style queue and messaging workloads
+        """
+
+        self._require_min_args("LPUSH", args,2)
+
+        key = args[0]
+        values = args[1:]
+
+        with self._lock:
+            if key not in self._lists:
+                #lazily initialize the list on first write
+                self._lists[key] = []
+            
+            #insert at the head to preserve LPUSH 
+            for value in values:
+                self._lists[key].insert(0,value)
+
+            return len(self._lists[key])
+    
+    def rpop(self, *args):
+        """
+        Remove and return the rightmost element of a list.
+
+        When paired with LPUSH, provides FIFO queue behavior.
+        """
+        
+        self._require_args("RPOP", args, 1)
+
+        key = args[0]
+
+        with self._lock:
+            queue = self._lists.get(key)
+
+            ##return nil for missing or empty list
+            if not queue:
+                return None
+            
+            #remove from the tail of the list
+            return queue.pop()
+    
+    def llen(self, *args):
+        self._require_args("LLEN", args, 1)
+
+        key = args[0]
+
+        with self._lock:
+            return len(self._lists.get(key, []))
+        
     
     
-    """
-    helper method to verify expiration
-    verifies current time, extracts expiry time 
-    if the key has expired, it removes the key from 
-    both the key-value store and the expiry dictionary
-    Lazy Expiration
-    """
     def _is_expired(self, key):
+        """
+        Implements lazy expiration
+
+        Expired keys are removed when accessed.
+        Currently avoids dedicated background cleanup processes
+        """
+
         expires_at = self._expiry.get(key)
 
         if expires_at is None:
@@ -235,13 +317,18 @@ class Server:
         if len(args) < minimum:
             raise CommandError(f"{command} requires at least {minimum} argument(s)")
 
-    """
-    Return the append-only file for logging commands.
-    """
+  
     def load_persistence(self):
+        """
+        Reconstruct in-memory state by replaying commands from
+        the append-only log during server startup.
+        """
         if not os.path.exists(self._aof_file):
             return
         
+
+        # Disable persistence writes during replay to avoid
+        # duplicating commands in the append-only log.
         self._loading = True
 
         try:
@@ -257,11 +344,16 @@ class Server:
             self._loading = False 
 
 
-    """
-    Append a command to the append-only file.
-    """
+    
     def _append_to_aof(self, command_parts):
+        """
+        Persist mutating commands to the append-only log.
+
+        The log is replayed during startup to restore durable state.
+        """
+
         if self._loading:
+            #skip writes while replaying persistence data
             return 
         
         with open(self._aof_file, "ab") as f:
@@ -269,6 +361,9 @@ class Server:
 
     
     def run(self):
+        """
+        start TCP server and begin accepting connections 
+        """
         self._server.serve_forever()
  
 
