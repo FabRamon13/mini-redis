@@ -239,6 +239,25 @@ This prevents resource leaks and prepares the system for future worker and queue
 
 ---
 
+# Distributed Worker Queue
+
+This project includes a queue-backed async processing system.
+
+
+FastAPI API
+↓
+LPUSH job_id
+↓
+Redis Clone Queue
+↓
+RPOP by Worker Pool
+↓
+Job Status Store
+
+--- 
+
+## Architecture:
+
 # Current Limitations
 
 - No active background expiration sweeps
