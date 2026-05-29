@@ -150,6 +150,95 @@ Integration tests cover:
 
 ---
 
+# Observability & Infrastructure
+
+The FastAPI layer includes operational tooling commonly found in production backend services.
+
+## Health Checks
+### Endpoint
+
+GET /health
+
+Returns service readiness information for:
+
+- FastAPI API status
+- Redis clone connectivity
+
+## Request Tracing
+
+Every request receives a unique request ID:
+
+X-Request-ID
+
+Request metadata is logged with:
+
+- request ID
+- endpoint path
+- status code
+- latency
+- client IP
+
+## Configuration Management
+
+Application configuration is centralized using typed settings loaded from environment variables.
+
+Examples:
+
+- redis_host
+- redis_port
+- cache_ttl
+
+This enables environment-specific configuration for local development, Docker deployments, and future cloud environments.
+
+---
+
+# Benchmarking
+
+The project includes benchmarking utilities for measuring cache effectiveness and request latency.
+
+## Cache Performance
+
+Example benchmark results:
+
+Cache Miss Latency: 1023.86 ms
+Cache Hit Latency: 5.96 ms
+Latency Improvement: 99.42%
+
+This demonstrates the effectiveness of the cache-aside architecture for repeated requests.
+
+Metrics collected:
+
+- p50 latency
+- p95 latency
+- average latency
+- cache hit improvement
+
+---
+
+# Docker Persistence
+
+Append-only file persistence is stored in a Docker volume:
+
+redis_data:/app/data
+
+This allows cached state and persistence logs to survive container restarts and container recreation.
+
+--- 
+
+# Graceful Shutdown
+
+The FastAPI application manages cache client lifecycle using lifespan events:
+
+Startup
+→ Create shared cache connection
+
+Shutdown
+→ Close socket connection cleanly
+
+This prevents resource leaks and prepares the system for future worker and queue infrastructure.
+
+---
+
 # Current Limitations
 
 - No active background expiration sweeps
@@ -158,16 +247,8 @@ Integration tests cover:
 - No snapshotting
 - TTL replay after restart resets expiration duration
 - Limited RESP compatibility compared to real Redis
+- No distributed worker queue
+- No semantic cache layer
+- No metrics dashboard
 
----
 
-# Future Improvements 
-
-- Background expiration worker
-- AOF rewrite/compaction
-- Snapshot persistence
-- Distributed worker queue
-- Async task processing
-- Metrics/observability dashboard
-- Kubernetes deployment
-- AI inference caching integration
