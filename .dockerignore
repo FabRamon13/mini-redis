@@ -3,3 +3,7 @@ __pycache__
 .git
 .pytest_cache
 appendonly.aof
+.env
+.env.*
+tests/
+benchmarks/

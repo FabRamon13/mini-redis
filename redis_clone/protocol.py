@@ -1,7 +1,7 @@
 from collections import namedtuple
 from io import BytesIO
 
-from exceptions import CommandError, Disconnect
+from redis_clone.exceptions import CommandError, Disconnect
 
 
 Error = namedtuple("Error", ("message",))

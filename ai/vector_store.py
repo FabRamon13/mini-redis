@@ -1,4 +1,4 @@
-from similarity import cosine_similarity
+from ai.similarity import cosine_similarity
 class VectorStore:
     def __init__(self):
         self._entries =[]

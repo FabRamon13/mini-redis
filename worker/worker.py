@@ -3,13 +3,13 @@ import time
 import os
 import socket 
 
-from client import Client
+from redis_clone.client import Client
 from datetime import datetime, timezone
-from embedding_router import get_embedding 
-from vector_store import VectorStore
-from similarity import cosine_similarity
-from inference import generate_response
-from exceptions import Disconnect
+from ai.embedding_router import get_embedding 
+from ai.vector_store import VectorStore
+from ai.similarity import cosine_similarity
+from ai.inference import generate_response
+from redis_clone.exceptions import Disconnect
 
 vector_store = VectorStore()
 

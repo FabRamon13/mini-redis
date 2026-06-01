@@ -1,6 +1,6 @@
 import socket
-from exceptions import CommandError
-from protocol import ProtocolHandler, Error
+from redis_clone.exceptions import CommandError
+from redis_clone.protocol import ProtocolHandler, Error
 
 class Client:
     def __init__(self, host="127.0.0.1", port=31337):

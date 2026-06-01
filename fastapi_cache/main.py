@@ -10,15 +10,13 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request
 from contextlib import asynccontextmanager 
 from pydantic import BaseModel
-from client import Client
+from redis_clone.client import Client
 from fastapi_cache.fake_db import FAKE_DB
 from fastapi_cache.config import Settings
 
 class InferenceRequest(BaseModel):
     prompt: str
     provider: str = "fake"
-
-sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 
 # Load runtime configuration from environment-backed settings.

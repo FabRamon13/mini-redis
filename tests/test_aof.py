@@ -1,7 +1,7 @@
 import tempfile
 import unittest
 
-from server import Server
+from redis_clone.server import Server
 
 
 class AOFTests(unittest.TestCase):

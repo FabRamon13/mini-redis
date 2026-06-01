@@ -1,4 +1,4 @@
-from embeddings import embed as fake_embed
+from ai.embeddings import embed as fake_embed
 
 def get_embedding(text, provider = "fake"):
     if provider == "fake":

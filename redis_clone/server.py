@@ -2,8 +2,8 @@ from gevent.pool import Pool
 from gevent.server import StreamServer
 import time, os
 from threading import Lock, RLock
-from exceptions import CommandError, Disconnect
-from protocol import ProtocolHandler, Error
+from redis_clone.exceptions import CommandError, Disconnect
+from redis_clone.protocol import ProtocolHandler, Error
 
     
 

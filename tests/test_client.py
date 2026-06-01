@@ -2,14 +2,14 @@ from pathlib import Path
 import sys
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
-from client import Client
+from redis_clone.client import Client
 import time 
 
 
 client = Client()
 
 import time
-from client import Client
+from redis_clone.client import Client
 
 client = Client()
 
