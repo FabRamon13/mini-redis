@@ -8,6 +8,9 @@ from datetime import datetime, timezone
 from embeddings import embed
 from vector_store import VectorStore
 from similarity import cosine_similarity
+from inference import generate_response
+from exceptions import Disconnect
+
 vector_store = VectorStore()
 
 def increment_metric(client,key):
@@ -59,12 +62,13 @@ def get_semantic_cache_entries(client):
 
     return entries
 
-def save_semantic_cache_entry(client, prompt, embedding, response):
+def save_semantic_cache_entry(client, prompt, embedding, response,provider):
     cache_id = str(len(get_semantic_cache_entries(client)) + 1)
     cache_key = f"semantic_cache:{cache_id}"
 
     entry = {
         "prompt": prompt,
+        "provider": provider,
         "embedding": embedding,
         "response": response,
     }
@@ -84,6 +88,7 @@ def save_semantic_cache_entry(client, prompt, embedding, response):
 
 def process_inference(job,client):
     prompt = job["prompt"]
+    provider = job.get("provider", "fake")
     vector = embed(prompt)
 
     entries = get_semantic_cache_entries(client)
@@ -93,6 +98,9 @@ def process_inference(job,client):
 
     for entry in entries:
         if entry is None:
+            continue
+
+        if entry.get("provider", "fake") != provider:
             continue
 
         embedding = entry.get("embedding")
@@ -111,6 +119,7 @@ def process_inference(job,client):
         
         return {
             "prompt": prompt,
+            "provider": provider,
             "cache": "hit",
             "matched_prompt": best_match["prompt"],
             "similarity_score": round(best_score, 4),
@@ -122,15 +131,13 @@ def process_inference(job,client):
     ##only cache misses pay the expensie inference cost
     time.sleep(3)
 
-    response = {
-        "prompt": prompt,
-        "answer": f"generated response for: {prompt}",
-    }
+    response = generate_response(prompt, provider = provider)
 
-    save_semantic_cache_entry(client, prompt, vector, response)
+    save_semantic_cache_entry(client, prompt, vector, response,provider)
     
     return {
         "prompt": prompt,
+        "provider": provider,
         "cache": "miss",
         "similarity_score": round(best_score, 4),
         "embedding_dimensions": len(vector),
@@ -154,7 +161,18 @@ def main():
     print(f"Worker {worker_id} started. Waiting for jobs..", flush =True)
 
     while True:
-        job_id = client.rpop("jobs")
+        try:
+            job_id = client.rpop("jobs")
+
+        except Disconnect:
+            print("Lost redis connection, reconnecting", flush=True)
+            client = connect_with_retry()
+            continue
+        
+        except OSError:
+            print("socket error, reconnecting", flush=True)
+            client = connect_with_retry()
+            continue
 
         if job_id is None:
             time.sleep(0.05)
@@ -221,8 +239,8 @@ def connect_with_retry(max_attempts=10,delay=1):
                 host=os.getenv("REDIS_HOST", "127.0.0.1"),
                 port=int(os.getenv("REDIS_PORT", "31337")),
             )
-        except ConnectionRefusedError:
-            print(f"Redis not ready, retrying... attempt {attempt + 1}/{max_attempts}")
+        except (ConnectionRefusedError,OSError) as exc:
+            print(f"Redis not ready, retrying... attempt {attempt + 1}/{max_attempts}: {exc}")
             time.sleep(delay)
 
     raise RuntimeError("Could not connect to Redis clone")

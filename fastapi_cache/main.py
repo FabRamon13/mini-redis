@@ -16,6 +16,7 @@ from fastapi_cache.config import Settings
 
 class InferenceRequest(BaseModel):
     prompt: str
+    provider: str = "fake"
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
@@ -343,6 +344,7 @@ def create_inference_request(payload: InferenceRequest, request: Request):
         "status": "queued",
         "type": "inference",
         "prompt": payload.prompt,
+        "provider": payload.provider,
         "created_at": now_iso(),
         "started_at": None,
         "completed_at": None,
