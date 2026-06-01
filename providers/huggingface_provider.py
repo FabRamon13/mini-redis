@@ -10,13 +10,24 @@ def get_model():
         _model = SentenceTransformer('all-MiniLM-L6-v2')
     return _model
 
-def generate(prompt):
+def embed_text(text):
     model = get_model()
-    
-    embedding = model.encode(prompt)
+    embedding = model.encode(text)
+
+    if hasattr(embedding, "tolist"):
+        embedding = embedding.tolist()
+
+    return embedding
+
+def generate(prompt):
+    embedding = embed_text(prompt)
 
     return {
         "provider": "huggingface",
         "embedding_dimensions": len(embedding),
         "message": "Embedding generated successfully."
     }
+
+
+
+    

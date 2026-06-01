@@ -5,7 +5,7 @@ import socket
 
 from client import Client
 from datetime import datetime, timezone
-from embeddings import embed
+from embedding_router import get_embedding 
 from vector_store import VectorStore
 from similarity import cosine_similarity
 from inference import generate_response
@@ -89,7 +89,7 @@ def save_semantic_cache_entry(client, prompt, embedding, response,provider):
 def process_inference(job,client):
     prompt = job["prompt"]
     provider = job.get("provider", "fake")
-    vector = embed(prompt)
+    vector = get_embedding(prompt, provider=provider)
 
     entries = get_semantic_cache_entries(client)
 
