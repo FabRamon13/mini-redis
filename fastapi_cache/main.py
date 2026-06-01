@@ -10,10 +10,15 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request
 from contextlib import asynccontextmanager 
 from pydantic import BaseModel
-sys.path.append(str(Path(__file__).resolve().parents[1]))
 from client import Client
 from fastapi_cache.fake_db import FAKE_DB
 from fastapi_cache.config import Settings
+
+class InferenceRequest(BaseModel):
+    prompt: str
+
+sys.path.append(str(Path(__file__).resolve().parents[1]))
+
 
 # Load runtime configuration from environment-backed settings.
 settings = Settings()
@@ -234,6 +239,7 @@ def create_job(request:Request):
     The API acts as the producer: it creates job metadata, stores initial
     job state, and enqueues the job ID for a separate worker process.
     """
+    cache = request.app.state.cache
     queue_size = cache.llen("jobs")
 
     if queue_size >= settings.max_queue_size:
@@ -242,7 +248,6 @@ def create_job(request:Request):
             detail="Queue is full. retry later."
         )
     
-    cache = request.app.state.cache
 
     job_id = str(uuid.uuid4())
     job_key = f"job:{job_id}"
@@ -274,6 +279,9 @@ def get_job_metrics(request: Request):
     cache = request.app.state.cache
     processed = cache.get("metrics:processed_jobs")
     failed = cache.get("metrics:failed_jobs")
+    semantic_hits = cache.get("metrics:semantic_cache_hits")
+    semantic_misses = cache.get("metrics:semantic_cache_misses")
+
 
     return {
         "queued_jobs": cache.llen("jobs"),
@@ -281,6 +289,8 @@ def get_job_metrics(request: Request):
         "processed_jobs": int(processed.decode("utf-8")) if processed else 0,
         "failed_jobs": int(failed.decode("utf-8")) if failed else 0,
         "max_queue_size": settings.max_queue_size,
+        "semantic_cache_hits": int(semantic_hits.decode("utf-8")) if semantic_hits else 0,
+        "semantic_cache_misses": int(semantic_misses.decode("utf-8")) if semantic_misses else 0,
     }
 
 @app.get("/jobs/{job_id}")
@@ -301,6 +311,44 @@ def get_dead_jobs_count(request: Request):
 
     return {
         "dead_jobs": cache.llen("dead_jobs")
+    }
+
+@app.post("/inference")
+def create_inference_request(payload: InferenceRequest, request: Request):
+    cache = request.app.state.cache
+    queue_size = cache.llen("jobs")
+
+    if queue_size >= settings.max_queue_size:
+        raise HTTPException(
+            status_code=429,
+            detail="Queue is full, try later"
+        )
+
+    job_id = str(uuid.uuid4())
+    job_key = f"job:{job_id}"
+
+    job_data = {
+        "id": job_id,
+        "status": "queued",
+        "type": "inference",
+        "prompt": payload.prompt,
+        "created_at": now_iso(),
+        "started_at": None,
+        "completed_at": None,
+        "failed_at": None,
+        "error": None,
+        "result": None,
+        "attempts": 0,
+        "max_attempts": 3,
+    }
+
+    cache.set(job_key, json.dumps(job_data))
+    cache.lpush("jobs", job_id)
+
+    return {
+        "job_id": job_id,
+        "status": "queued",
+        "type": "inference",
     }
 
 
