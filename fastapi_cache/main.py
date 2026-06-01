@@ -181,7 +181,6 @@ def cache_stats(request: Request):
     Return process local cach hit/miss metrics for basic observability
     """
     stats = request.app.state.stats
-    time.sleep(1)
     return stats
 
 @app.delete("/cache/users/{user_id}")
@@ -277,11 +276,22 @@ def create_job(request:Request):
 @app.get("/jobs/metrics")
 def get_job_metrics(request: Request):
     cache = request.app.state.cache
+    
     processed = cache.get("metrics:processed_jobs")
     failed = cache.get("metrics:failed_jobs")
     semantic_hits = cache.get("metrics:semantic_cache_hits")
     semantic_misses = cache.get("metrics:semantic_cache_misses")
 
+    semantic_hits_count = int(semantic_hits.decode("utf-8")) if semantic_hits else 0
+    semantic_misses_count = int(semantic_misses.decode("utf-8")) if semantic_misses else 0
+
+    total_semantic_requests = semantic_hits_count + semantic_misses_count
+
+    semantic_hit_rate = (
+        semantic_hits_count / total_semantic_requests
+        if total_semantic_requests > 0 
+        else 0
+    )
 
     return {
         "queued_jobs": cache.llen("jobs"),
@@ -289,8 +299,9 @@ def get_job_metrics(request: Request):
         "processed_jobs": int(processed.decode("utf-8")) if processed else 0,
         "failed_jobs": int(failed.decode("utf-8")) if failed else 0,
         "max_queue_size": settings.max_queue_size,
-        "semantic_cache_hits": int(semantic_hits.decode("utf-8")) if semantic_hits else 0,
-        "semantic_cache_misses": int(semantic_misses.decode("utf-8")) if semantic_misses else 0,
+        "semantic_cache_hits": semantic_hits_count,
+        "semantic_cache_misses": semantic_misses_count,
+        "semantic_cache_hit_rate": round(semantic_hit_rate,4),
     }
 
 @app.get("/jobs/{job_id}")

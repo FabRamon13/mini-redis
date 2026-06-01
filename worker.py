@@ -83,8 +83,6 @@ def save_semantic_cache_entry(client, prompt, embedding, response):
     client.set("semantic_cache:index", json.dumps(keys))
 
 def process_inference(job,client):
-    time.sleep(3)
-
     prompt = job["prompt"]
     vector = embed(prompt)
 
@@ -110,6 +108,7 @@ def process_inference(job,client):
 
     if best_match is not None and best_score >= 0.75:
         increment_metric(client,"metrics:semantic_cache_hits")
+        
         return {
             "prompt": prompt,
             "cache": "hit",
@@ -117,14 +116,19 @@ def process_inference(job,client):
             "similarity_score": round(best_score, 4),
             "response": best_match["response"],
         }
+    
+    increment_metric(client, "metrics:semantic_cache_misses")
+
+    ##only cache misses pay the expensie inference cost
+    time.sleep(3)
 
     response = {
         "prompt": prompt,
         "answer": f"generated response for: {prompt}",
     }
-    increment_metric(client, "metrics:semantic_cache_misses")
 
     save_semantic_cache_entry(client, prompt, vector, response)
+    
     return {
         "prompt": prompt,
         "cache": "miss",
@@ -153,7 +157,7 @@ def main():
         job_id = client.rpop("jobs")
 
         if job_id is None:
-            time.sleep(1)
+            time.sleep(0.05)
             continue
 
         job_id = job_id.decode("utf-8")
