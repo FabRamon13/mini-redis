@@ -18,6 +18,9 @@ from redis_clone.exceptions import Disconnect
 from ai.vector_store import VectorStore
 from ai.embedding_router import get_embedding
 from ai.inference import generate_response
+from worker.faiss_index import add_to_faiss
+from worker.faiss_index import get_faiss_index
+from worker.faiss_index import rebuild_faiss_indexes
 
 def load_semantic_cache_threshold(value=None):
     if value is None:
@@ -89,16 +92,30 @@ def process_inference(job,client):
     vector = get_embedding(prompt, provider=provider)
 
     entries = get_semantic_cache_entries(client)
-
     vector_store = VectorStore(entries)
 
-    top_matches = vector_store.search_top_k(
-        embedding=vector,
-        provider=provider,
-        model_id=model_id,
-        model_revision=model_revision,
-        k=3,
-    )
+    if provider == "huggingface":
+        faiss_store = get_faiss_index(
+            entries=entries,
+            provider=provider,
+            model_id=model_id,
+            model_revision=model_revision,
+            dimensions=len(vector),
+        )
+
+        top_matches = faiss_store.search_top_k(
+            embedding=vector,
+            k=3,
+        )
+    else:
+        top_matches = vector_store.search_top_k(
+            embedding=vector,
+            provider=provider,
+            model_id=model_id,
+            model_revision=model_revision,
+            k=3,
+        )
+
 
     formatted_top_matches = [
         {
@@ -134,7 +151,7 @@ def process_inference(job,client):
 
     response = generate_response(prompt, provider = provider)
 
-    save_semantic_cache_entry(
+    saved_entry = save_semantic_cache_entry(
         client,
         prompt,
         vector,
@@ -142,6 +159,9 @@ def process_inference(job,client):
         provider,
         SEMANTIC_CACHE_MAX_ENTRIES,
     )
+
+    if provider == "huggingface":
+        add_to_faiss(saved_entry)
     
     return {
         "prompt": prompt,
@@ -347,14 +367,20 @@ def _load_claim(client, job_id):
 
     return claim if isinstance(claim, dict) else {}
 
+def rebuild_worker_faiss_indexes(client):
+    entries = get_semantic_cache_entries(client)
+    return rebuild_faiss_indexes(entries, provider="huggingface")
+
 def main():
     client = connect_with_retry()
 
     worker_id = f"{socket.gethostname()}:{os.getpid()}"
     recovered = recover_stale_processing_jobs(client)
+    faiss_indexes = rebuild_worker_faiss_indexes(client)
     last_recovery = time.monotonic()
 
     print(f"Recovered {recovered} stale processing jobs", flush=True)
+    print(f"Built {faiss_indexes} FAISS indexes", flush=True)
     print(f"Worker {worker_id} started. Waiting for jobs..", flush =True)
 
     while True:
@@ -381,6 +407,7 @@ def main():
             print("Lost redis connection, reconnecting", flush=True)
             client = connect_with_retry()
             recovered = recover_stale_processing_jobs(client)
+            rebuild_worker_faiss_indexes(client)
             last_recovery = time.monotonic()
             continue
         
@@ -388,6 +415,7 @@ def main():
             print("socket error, reconnecting", flush=True)
             client = connect_with_retry()
             recovered = recover_stale_processing_jobs(client)
+            rebuild_worker_faiss_indexes(client)
             last_recovery = time.monotonic()
             continue
 

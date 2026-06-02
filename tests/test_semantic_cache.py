@@ -6,6 +6,8 @@ from unittest.mock import patch
 from worker.worker import load_non_negative_float
 from worker.worker import load_semantic_cache_threshold
 from worker.worker import process_inference
+from worker.faiss_index import get_faiss_index
+from worker.faiss_index import reset_faiss_indexes
 from worker.semantic_cache import get_model_id
 from worker.semantic_cache import get_semantic_cache_entries
 from worker.semantic_cache import prune_semantic_cache
@@ -86,13 +88,14 @@ class SemanticCacheTests(unittest.TestCase):
         client = MemoryClient()
         embedding = [0.1, 0.2, 0.3]
 
-        entry_id = save_semantic_cache_entry(
+        saved_entry = save_semantic_cache_entry(
             client,
             "what is a cache",
             embedding,
             {"answer": "cached response"},
             "fake",
         )
+        entry_id = saved_entry["entry_id"]
 
         self.assertEqual(str(uuid.UUID(entry_id)), entry_id)
 
@@ -112,20 +115,22 @@ class SemanticCacheTests(unittest.TestCase):
     def test_save_semantic_cache_entry_creates_distinct_indexed_entries(self):
         client = MemoryClient()
 
-        first_id = save_semantic_cache_entry(
+        first_entry = save_semantic_cache_entry(
             client,
             "first prompt",
             [1.0, 0.0],
             {"answer": "first"},
             "fake",
         )
-        second_id = save_semantic_cache_entry(
+        second_entry = save_semantic_cache_entry(
             client,
             "second prompt",
             [0.0, 1.0],
             {"answer": "second"},
             "fake",
         )
+        first_id = first_entry["entry_id"]
+        second_id = second_entry["entry_id"]
 
         self.assertNotEqual(first_id, second_id)
 
@@ -144,7 +149,7 @@ class SemanticCacheTests(unittest.TestCase):
     def test_save_semantic_cache_entry_skips_equivalent_duplicate(self):
         client = MemoryClient()
 
-        first_id = save_semantic_cache_entry(
+        first_entry = save_semantic_cache_entry(
             client,
             "same prompt",
             [1.0, 0.0],
@@ -152,7 +157,7 @@ class SemanticCacheTests(unittest.TestCase):
             "fake",
             max_entries=10,
         )
-        second_id = save_semantic_cache_entry(
+        second_entry = save_semantic_cache_entry(
             client,
             "same prompt",
             [1.0, 0.0],
@@ -160,6 +165,8 @@ class SemanticCacheTests(unittest.TestCase):
             "fake",
             max_entries=10,
         )
+        first_id = first_entry["entry_id"]
+        second_id = second_entry["entry_id"]
 
         self.assertEqual(second_id, first_id)
         self.assertEqual(
@@ -170,7 +177,7 @@ class SemanticCacheTests(unittest.TestCase):
     def test_save_semantic_cache_entry_prunes_oldest_entries(self):
         client = MemoryClient()
 
-        first_id = save_semantic_cache_entry(
+        first_entry = save_semantic_cache_entry(
             client,
             "first prompt",
             [1.0, 0.0],
@@ -178,7 +185,7 @@ class SemanticCacheTests(unittest.TestCase):
             "fake",
             max_entries=2,
         )
-        second_id = save_semantic_cache_entry(
+        second_entry = save_semantic_cache_entry(
             client,
             "second prompt",
             [0.0, 1.0],
@@ -186,7 +193,7 @@ class SemanticCacheTests(unittest.TestCase):
             "fake",
             max_entries=2,
         )
-        third_id = save_semantic_cache_entry(
+        third_entry = save_semantic_cache_entry(
             client,
             "third prompt",
             [0.5, 0.5],
@@ -194,6 +201,9 @@ class SemanticCacheTests(unittest.TestCase):
             "fake",
             max_entries=2,
         )
+        first_id = first_entry["entry_id"]
+        second_id = second_entry["entry_id"]
+        third_id = third_entry["entry_id"]
 
         self.assertNotIn(f"semantic_cache:{first_id}", client.data)
         self.assertEqual(
@@ -242,13 +252,14 @@ class SemanticCacheTests(unittest.TestCase):
 
     def test_process_inference_skips_entry_from_different_model(self):
         client = MemoryClient()
-        entry_id = save_semantic_cache_entry(
+        saved_entry = save_semantic_cache_entry(
             client,
             "cached prompt",
             [1.0, 0.0],
             {"answer": "stale"},
             "fake",
         )
+        entry_id = saved_entry["entry_id"]
         cache_key = f"semantic_cache:{entry_id}"
         entry = json.loads(client.data[cache_key])
         entry["model_id"] = "hash-embedding-v0"
@@ -287,13 +298,14 @@ class SemanticCacheTests(unittest.TestCase):
 
     def test_process_inference_hit_includes_formatted_top_matches(self):
         client = MemoryClient()
-        entry_id = save_semantic_cache_entry(
+        saved_entry = save_semantic_cache_entry(
             client,
             "cached prompt",
             [1.0, 0.0],
             {"answer": "cached"},
             "fake",
         )
+        entry_id = saved_entry["entry_id"]
 
         with patch("worker.worker.get_embedding", return_value=[1.0, 0.0]):
             result = process_inference({"prompt": "new prompt", "provider": "fake"}, client)
@@ -313,13 +325,14 @@ class SemanticCacheTests(unittest.TestCase):
 
     def test_process_inference_miss_includes_below_threshold_top_matches(self):
         client = MemoryClient()
-        entry_id = save_semantic_cache_entry(
+        saved_entry = save_semantic_cache_entry(
             client,
             "different prompt",
             [0.0, 1.0],
             {"answer": "cached"},
             "fake",
         )
+        entry_id = saved_entry["entry_id"]
 
         with (
             patch("worker.worker.get_embedding", return_value=[1.0, 0.0]),
@@ -353,6 +366,34 @@ class SemanticCacheTests(unittest.TestCase):
 
         self.assertEqual(result["cache"], "miss")
         self.assertEqual(result["top_matches"], [])
+
+    def test_huggingface_miss_adds_saved_entry_to_local_faiss_index(self):
+        client = MemoryClient()
+        reset_faiss_indexes()
+
+        with (
+            patch("worker.worker.get_embedding", return_value=[1.0, 0.0]),
+            patch("worker.worker.generate_response", return_value={"answer": "fresh"}),
+            patch("worker.worker.time.sleep"),
+        ):
+            result = process_inference(
+                {"prompt": "new prompt", "provider": "huggingface"},
+                client,
+            )
+
+        entries = get_semantic_cache_entries(client)
+        store = get_faiss_index(
+            entries=entries,
+            provider="huggingface",
+            model_id="sentence-transformers/all-MiniLM-L6-v2",
+            model_revision="main",
+            dimensions=2,
+        )
+        matches = store.search_top_k([1.0, 0.0], k=1)
+
+        self.assertEqual(result["cache"], "miss")
+        self.assertEqual(store.index.ntotal, 1)
+        self.assertEqual(matches[0]["entry"]["prompt"], "new prompt")
 
 
 if __name__ == "__main__":

@@ -175,7 +175,7 @@ def save_semantic_cache_entry(
             model_revision,
         ):
             prune_semantic_cache(client, max_entries)
-            return entry["entry_id"]
+            return entry
 
     cache_id = str(uuid.uuid4())
     cache_key = f"semantic_cache:{cache_id}"
@@ -203,4 +203,4 @@ def save_semantic_cache_entry(
     client.lpush("semantic_cache:index", cache_key)
     prune_semantic_cache(client, max_entries)
 
-    return cache_id
+    return entry
