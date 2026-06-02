@@ -23,7 +23,7 @@ class ProtocolHandler:
 
         if not first_byte:
             raise Disconnect()
-        
+
         try:
             return self.handlers[first_byte](socket_file)
         except KeyError:
@@ -95,13 +95,29 @@ class ProtocolHandler:
         return int(socket_file.readline().rstrip(b"\r\n"))
 
     def handle_string(self, socket_file):
-        length = int(socket_file.readline().rstrip(b"\r\n"))
+        length_line = socket_file.readline()
+
+        if not length_line:
+            raise CommandError("Missing bulk string length")
+
+        try:
+            length = int(length_line.rstrip(b"\r\n"))
+        except ValueError:
+            raise CommandError("Invalid bulk string length")
 
         if length == -1:
             return None
 
-        length += 2
-        return socket_file.read(length)[:-2]
+        if length < -1:
+            raise CommandError("Invalid bulk string length")
+
+        payload = socket_file.read(length)
+        terminator = socket_file.read(2)
+
+        if len(payload) != length or terminator != b"\r\n":
+            raise CommandError("Truncated bulk string")
+
+        return payload
 
     def handle_array(self, socket_file):
         num_elements = int(socket_file.readline().rstrip(b"\r\n"))
@@ -120,48 +136,3 @@ class ProtocolHandler:
         ]
 
         return dict(zip(elements[::2], elements[1::2]))
-
-    def _write(self, buf, data):
-        if isinstance(data, str):
-            data = data.encode("utf-8")
-
-        if isinstance(data, bytes):
-            buf.write(
-                b"$" + str(len(data)).encode("utf-8") +
-                b"\r\n" + data + b"\r\n"
-            )
-
-        elif isinstance(data, int):
-            buf.write(
-                b":" + str(data).encode("utf-8") + b"\r\n"
-            )
-
-        elif isinstance(data, Error):
-            message = data.message
-            if isinstance(message, str):
-                message = message.encode("utf-8")
-
-            buf.write(b"-" + message + b"\r\n")
-
-        elif isinstance(data, (list, tuple)):
-            buf.write(
-                b"*" + str(len(data)).encode("utf-8") + b"\r\n"
-            )
-
-            for item in data:
-                self._write(buf, item)
-
-        elif isinstance(data, dict):
-            buf.write(
-                b"%" + str(len(data)).encode("utf-8") + b"\r\n"
-            )
-
-            for key, value in data.items():
-                self._write(buf, key)
-                self._write(buf, value)
-
-        elif data is None:
-            buf.write(b"$-1\r\n")
-
-        else:
-            raise CommandError(f"unrecognized type: {type(data)}")

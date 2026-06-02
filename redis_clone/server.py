@@ -1,7 +1,9 @@
 from gevent.pool import Pool
 from gevent.server import StreamServer
+import json
+import math
 import time, os
-from threading import Lock, RLock
+from threading import RLock
 from redis_clone.exceptions import CommandError, Disconnect
 from redis_clone.protocol import ProtocolHandler, Error
 
@@ -34,7 +36,7 @@ class Server:
         )
 
         self._protocol = ProtocolHandler()
-        
+
         ##primary in memory k/v store
         self._kv = {}
 
@@ -95,7 +97,7 @@ class Server:
 
         if command not in self._commands:
             raise CommandError(f"Unrecognized command: {command!r}")
-        
+
         ##where the actual command execution happens
         return self._commands[command](*data[1:])
         
@@ -113,7 +115,40 @@ class Server:
             b"LPUSH": self.lpush,
             b"RPOP": self.rpop,
             b"LLEN": self.llen,
+            b"INCR": self.incr,
+            b"LRANGE": self.lrange,
+            b"RPOPLPUSH": self.rpoplpush,
+            b"LREM": self.lrem,
+            b"CLAIM": self.claim,
+            b"REQUEUE": self.requeue,
+            b"ACK": self.ack,
+            b"UPDATECLAIM": self.update_claim,
+            b"FINISH": self.finish,
+            b"ENQUEUE": self.enqueue,
+            b"EXPIREAT": self.expireat,
         }
+    def incr(self, *args):
+        self._require_args("INCR", args, 1)
+        key = args[0]
+
+        with self._lock:
+            if self._is_expired(key):
+                current = None
+            else:
+                current = self._kv.get(key)
+
+            if current is None:
+                value = 1
+            else:
+                try:
+                    value = int(current) + 1
+                except (TypeError, ValueError):
+                    raise CommandError("value is not an integer")
+
+            self._kv[key] = str(value).encode("utf-8")
+            self._append_to_aof([b"INCR", key])
+
+            return value
     def get(self, *args):
         self._require_args("GET", args,1)
 
@@ -132,30 +167,43 @@ class Server:
         key = args[0]
         value = args[1]
         options = args[2:]
+        expiry = None
 
-        
+        if options:
+            if len(options) != 2:
+                raise CommandError("SET options must be EX seconds")
+
+            option, seconds = options
+
+            if option.upper() != b"EX":
+                raise CommandError("Only EX option is supported")
+
+            try:
+                ttl_seconds = float(seconds)
+            except (TypeError, ValueError):
+                raise CommandError("invalid expire time")
+
+            if ttl_seconds <= 0:
+                raise CommandError("invalid expire time")
+
+            expiry = time.time() + ttl_seconds
+
         with self._lock:
-            # Mutating operations are synchronized to maintain consistency
-            # across concurrent client requests.
-
             self._kv[key] = value
 
-            if options:
-                if len(options) != 2:
-                    raise CommandError("SET options must be EX seconds")
-                
-                option, seconds = options
-
-                if option.upper() != b"EX":
-                    raise CommandError("Only EX option is supported")
-
-                self._expiry[key] = time.time() + float(seconds)
-
-            else:
+            if expiry is None:
                 self._expiry.pop(key, None)
-            
-            #Persist the mutation for crash recovery
-            self._append_to_aof([b"SET", key, value] + list(options))
+            else:
+                self._expiry[key] = expiry
+
+            self._append_to_aof([b"SET", key, value])
+
+            if expiry is not None:
+                self._append_to_aof([
+                    b"EXPIREAT",
+                    key,
+                    str(expiry).encode("utf-8"),
+                ])
 
         return 1
 
@@ -174,13 +222,18 @@ class Server:
             
         return 0
 
-    def flush(self):
+    def flush(self, *args):
+        self._require_args("FLUSH", args, 0)
+
         with self._lock:
-            self._append_to_aof([b"FLUSH"])
             kvlen = len(self._kv)
             self._kv.clear()
             self._expiry.clear()
-            return kvlen
+            self._lists.clear()
+
+            self._append_to_aof([b"FLUSH"])
+
+        return kvlen
 
     def mget(self, *keys):
         with self._lock:
@@ -202,6 +255,206 @@ class Server:
             self._append_to_aof([b"MSET"] + list(items))
             
             return len(data)
+
+    def rpoplpush(self, *args):
+        self._require_args("RPOPLPUSH", args, 2)
+
+        source = args[0]
+        destination = args[1]
+
+        with self._lock:
+            source_values = self._lists.get(source)
+
+            if not source_values:
+                return None
+
+            value = source_values.pop()
+
+            self._lists.setdefault(destination, [])
+            self._lists[destination].insert(0, value)
+
+            self._append_to_aof([b"RPOPLPUSH", source, destination])
+
+            return value
+
+    def lrem(self, *args):
+        self._require_args("LREM", args, 2)
+
+        key = args[0]
+        value = args[1]
+
+        with self._lock:
+            values = self._lists.get(key, [])
+            new_values = [item for item in values if item != value]
+            removed = len(values) - len(new_values)
+
+            if removed:
+                self._lists[key] = new_values
+                self._append_to_aof([b"LREM", key, value])
+
+            return removed
+
+    def claim(self, *args):
+        self._require_args("CLAIM", args, 6)
+
+        source, destination, worker_id, claim_token, claimed_at, raw_lease_seconds = args
+
+        try:
+            lease_seconds = int(raw_lease_seconds)
+        except (TypeError, ValueError):
+            raise CommandError("invalid lease seconds")
+
+        if lease_seconds <= 0:
+            raise CommandError("invalid lease seconds")
+
+        try:
+            claim_payload = json.dumps({
+                "worker_id": worker_id.decode("utf-8"),
+                "claim_token": claim_token.decode("utf-8"),
+                "claimed_at": claimed_at.decode("utf-8"),
+                "lease_seconds": lease_seconds,
+            }).encode("utf-8")
+        except (AttributeError, UnicodeDecodeError):
+            raise CommandError("invalid claim metadata")
+
+        with self._lock:
+            source_values = self._lists.get(source)
+
+            if not source_values:
+                return None
+
+            job_id = source_values.pop()
+            self._lists.setdefault(destination, []).insert(0, job_id)
+            self._kv[self._claim_key(job_id)] = claim_payload
+
+            self._append_to_aof([
+                b"CLAIM",
+                source,
+                destination,
+                worker_id,
+                claim_token,
+                claimed_at,
+                str(lease_seconds).encode("utf-8"),
+            ])
+
+            return job_id
+
+    def requeue(self, *args):
+        self._require_args("REQUEUE", args, 6)
+
+        source, destination, job_id, job_key, job_payload, claim_token = args
+
+        with self._lock:
+            if not self._claim_token_matches(job_id, claim_token):
+                return 0
+
+            source_values = self._lists.get(source, [])
+            remaining_values = [item for item in source_values if item != job_id]
+            removed = len(source_values) - len(remaining_values)
+
+            if not removed:
+                return 0
+
+            self._lists[source] = remaining_values
+            destination_values = self._lists.setdefault(destination, [])
+
+            if job_id not in destination_values:
+                destination_values.insert(0, job_id)
+
+            self._kv[job_key] = job_payload
+            self._expiry.pop(job_key, None)
+            self._kv.pop(self._claim_key(job_id), None)
+
+            self._append_to_aof([
+                b"REQUEUE",
+                source,
+                destination,
+                job_id,
+                job_key,
+                job_payload,
+                claim_token,
+            ])
+
+            return removed
+
+    def ack(self, *args):
+        self._require_args("ACK", args, 3)
+
+        source, job_id, claim_token = args
+
+        with self._lock:
+            if not self._claim_token_matches(job_id, claim_token):
+                return 0
+
+            source_values = self._lists.get(source, [])
+            remaining_values = [item for item in source_values if item != job_id]
+            removed = len(source_values) - len(remaining_values)
+            claim_key = self._claim_key(job_id)
+            claim_removed = self._kv.pop(claim_key, None) is not None
+            self._expiry.pop(claim_key, None)
+
+            if removed:
+                self._lists[source] = remaining_values
+
+            if removed or claim_removed:
+                self._append_to_aof([b"ACK", source, job_id, claim_token])
+
+            return removed
+
+    def finish(self, *args):
+        self._require_args("FINISH", args, 6)
+
+        source, destination, job_id, job_key, job_payload, claim_token = args
+
+        with self._lock:
+            if not self._claim_token_matches(job_id, claim_token):
+                return 0
+
+            source_values = self._lists.get(source, [])
+            remaining_values = [item for item in source_values if item != job_id]
+            removed = len(source_values) - len(remaining_values)
+
+            if not removed:
+                return 0
+
+            self._lists[source] = remaining_values
+
+            if destination:
+                destination_values = self._lists.setdefault(destination, [])
+
+                if job_id not in destination_values:
+                    destination_values.insert(0, job_id)
+
+            self._kv[job_key] = job_payload
+            self._expiry.pop(job_key, None)
+            self._kv.pop(self._claim_key(job_id), None)
+
+            self._append_to_aof([
+                b"FINISH",
+                source,
+                destination,
+                job_id,
+                job_key,
+                job_payload,
+                claim_token,
+            ])
+
+            return removed
+
+    def update_claim(self, *args):
+        self._require_args("UPDATECLAIM", args, 4)
+
+        job_id, job_key, job_payload, claim_token = args
+
+        with self._lock:
+            if not self._claim_token_matches(job_id, claim_token):
+                return 0
+
+            self._kv[job_key] = job_payload
+            self._expiry.pop(job_key, None)
+            self._append_to_aof([b"UPDATECLAIM", job_id, job_key, job_payload, claim_token])
+
+            return 1
     
     def ping(self):
         return b"PONG"
@@ -222,13 +475,13 @@ class Server:
         with self._lock:
             if self._is_expired(key):
                 return -2 ##key doesnt exists 
-            
+
             if key not in self._kv:
                 return -2
 
             if key not in self._expiry:
                 return -1
-        
+
             return int(self._expiry[key] - time.time())
         
     def lpush(self, *args):
@@ -252,6 +505,8 @@ class Server:
             for value in values:
                 self._lists[key].insert(0,value)
 
+            self._append_to_aof([b"LPUSH", key] + list(values))
+
             return len(self._lists[key])
     
     def rpop(self, *args):
@@ -273,7 +528,10 @@ class Server:
                 return None
             
             #remove from the tail of the list
-            return queue.pop()
+            value = queue.pop()
+            self._append_to_aof([b"RPOP", key])
+
+            return value
     
     def llen(self, *args):
         self._require_args("LLEN", args, 1)
@@ -304,6 +562,31 @@ class Server:
             return True
         
         return False
+
+    def _claim_key(self, job_id):
+        if isinstance(job_id, bytes):
+            return b"worker_claim:" + job_id
+
+        return f"worker_claim:{job_id}"
+
+    def _claim_token_matches(self, job_id, claim_token):
+        claim_payload = self._kv.get(self._claim_key(job_id))
+
+        if claim_payload is None:
+            return claim_token in (b"", "")
+
+        try:
+            claim = json.loads(claim_payload.decode("utf-8"))
+            expected_token = claim["claim_token"]
+            supplied_token = (
+                claim_token.decode("utf-8")
+                if isinstance(claim_token, bytes)
+                else claim_token
+            )
+        except (AttributeError, KeyError, TypeError, UnicodeDecodeError, json.JSONDecodeError):
+            return False
+
+        return supplied_token == expected_token
     
     """
     helper functions to help with command validation 
@@ -336,7 +619,7 @@ class Server:
                 while True:
                     try:
                         data = self._protocol.handle_request(f)
-                    except Disconnect:
+                    except (CommandError, Disconnect):
                         break
 
                     self.get_response(data)
@@ -359,6 +642,98 @@ class Server:
         with open(self._aof_file, "ab") as f:
             self._protocol.write_response(f, command_parts)
 
+    def lrange(self, *args):
+        self._require_args("LRANGE", args, 3)
+
+        key = args[0]
+
+        try:
+            start = int(args[1])
+            stop = int(args[2])
+        except (TypeError, ValueError):
+            raise CommandError("LRANGE start and stop must be integers")
+
+        with self._lock:
+            values = self._lists.get(key, [])
+            length = len(values)
+
+            if start < 0:
+                start = max(length + start, 0)
+
+            if stop < 0:
+                stop = length + stop
+
+            if start > stop or start >= length or stop < 0:
+                return []
+
+            return values[start:stop + 1]
+
+    def enqueue(self, *args):
+        self._require_args("ENQUEUE", args, 5)
+
+        queue_key = args[0]
+        job_id = args[1]
+        job_key = args[2]
+        job_payload = args[3]
+
+        try:
+            max_size = int(args[4])
+        except (TypeError, ValueError):
+            raise CommandError("invalid max queue size")
+
+        if max_size <= 0:
+            raise CommandError("invalid max queue size")
+
+        with self._lock:
+            queue = self._lists.setdefault(queue_key, [])
+
+            if len(queue) >= max_size:
+                raise CommandError("queue is full")
+
+            self._kv[job_key] = job_payload
+            self._expiry.pop(job_key, None)
+            queue.insert(0, job_id)
+
+            self._append_to_aof([
+                b"ENQUEUE",
+                queue_key,
+                job_id,
+                job_key,
+                job_payload,
+                str(max_size).encode("utf-8")
+            ])
+
+            return b"OK"
+    def expireat(self, *args):
+        self._require_args("EXPIREAT", args, 2)
+
+        key = args[0]
+
+        try:
+            expire_at = float(args[1])
+        except (TypeError, ValueError):
+            raise CommandError("invalid expire timestamp")
+
+        if not math.isfinite(expire_at):
+            raise CommandError("invalid expire timestamp")
+
+        with self._lock:
+            if key not in self._kv:
+                return 0
+
+            if expire_at <= time.time():
+                self._kv.pop(key, None)
+                self._expiry.pop(key, None)
+                return 0
+
+            self._expiry[key] = expire_at
+            self._append_to_aof([
+                b"EXPIREAT",
+                key,
+                str(expire_at).encode("utf-8"),
+            ])
+
+            return 1
     
     def run(self):
         """

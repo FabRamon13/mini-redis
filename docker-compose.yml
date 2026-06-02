@@ -38,6 +38,9 @@ services:
     environment:
       REDIS_HOST: redis_clone
       REDIS_PORT: 31337
+      SEMANTIC_CACHE_THRESHOLD: "0.75"
+      SEMANTIC_CACHE_MAX_ENTRIES: "1000"
+      WORKER_LEASE_SECONDS: "60"
     volumes:
       - .:/app
     command: ["python", "-m", "worker.worker"]

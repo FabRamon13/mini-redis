@@ -1,33 +1,35 @@
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
-import sys
-
-sys.path.append(str(Path(__file__).resolve().parents[1]))
+import os
+import unittest
 
 from redis_clone.client import Client
 
-def worker(i):
-    client = Client()
-    key = f"user:{i}"
-    value = f"value:{i}"
 
-    assert client.set(key,value) == 1
-    assert client.get(key) == value.encode()
+@unittest.skipUnless(
+    os.getenv("RUN_INTEGRATION_TESTS") == "1",
+    "set RUN_INTEGRATION_TESTS=1 with a running Redis clone",
+)
+class ConcurrencyIntegrationTests(unittest.TestCase):
+    def setUp(self):
+        client = Client()
+        client.flush()
+        client.close()
 
-    return True 
+    def test_concurrent_clients(self):
+        def write_and_read(index):
+            client = Client()
 
-def main():
-    client = Client()
-    client.flush()
+            try:
+                key = f"user:{index}"
+                value = f"value:{index}"
+                self.assertEqual(client.set(key, value), 1)
+                self.assertEqual(client.get(key), value.encode())
+            finally:
+                client.close()
 
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        results = list(executor.map(worker,range(50)))
-
-
-    assert all(results)
-    print("Concurrent client test passed.")
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            list(executor.map(write_and_read, range(50)))
 
 
 if __name__ == "__main__":
-    main()
-
+    unittest.main()

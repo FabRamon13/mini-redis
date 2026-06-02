@@ -1,26 +1,20 @@
-import sys
-from pathlib import Path
+import tempfile
+import unittest
 
-sys.path.append(str(Path(__file__).resolve().parents[1]))
-from redis_clone.client import Client 
+from redis_clone.server import Server
 
-client = Client()
-key = "persistent_name"
 
-if len(sys.argv) > 1 and sys.argv[1] == "write":
-    print("Writing persistent value...")
-    client.flush()
-    assert client.set(key, "Ramon") == 1
-    assert client.get(key) == b"Ramon"
-    print("Now restart the server and run: python test_persistence.py read")
+class PersistenceTests(unittest.TestCase):
+    def test_value_survives_server_reload(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            aof_file = f"{tmpdir}/appendonly.aof"
+            server = Server(port=0, aof_file=aof_file)
+            server.set(b"persistent_name", b"Ramon")
 
-elif len(sys.argv) > 1 and sys.argv[1] == "read":
-    print("Reading persistent value after restart...")
-    assert client.get(key) == b"Ramon"
-    print("Persistence test passed.")
+            reloaded = Server(port=0, aof_file=aof_file)
 
-else:
-    print("Usage:")
-    print("python test_persistence.py write")
-    print("restart server")
-    print("python test_persistence.py read")
+            self.assertEqual(reloaded.get(b"persistent_name"), b"Ramon")
+
+
+if __name__ == "__main__":
+    unittest.main()

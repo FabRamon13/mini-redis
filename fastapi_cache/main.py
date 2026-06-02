@@ -1,22 +1,26 @@
 import json
-import sys
 import time
 import asyncio
 import uuid
 import logging
 
 from datetime import datetime, timezone
-from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request
 from contextlib import asynccontextmanager 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from redis_clone.client import Client
+from redis_clone.exceptions import CommandError
 from fastapi_cache.fake_db import FAKE_DB
 from fastapi_cache.config import Settings
+from typing import Literal
 
 class InferenceRequest(BaseModel):
-    prompt: str
-    provider: str = "fake"
+    prompt: str = Field(
+        min_length =1,
+        max_length = 1000,
+    )
+
+    provider: Literal["fake", "huggingface"] = "fake"
 
 
 # Load runtime configuration from environment-backed settings.
@@ -158,7 +162,7 @@ def get_user(user_id: str, request: Request):
         }
     
     stats["misses"] +=1 
-    time.sleep(1)
+    time.sleep(settings.demo_db_delay_seconds)
     user = FAKE_DB.get(user_id)
 
     if user is None:
@@ -197,7 +201,6 @@ def invalidate_user_cache(user_id: str, request: Request):
 
     deleted = cache.delete(cache_key)
 
-    time.sleep(1)
     return {
         "cache_key": cache_key,
         "deleted": bool(deleted),
@@ -238,15 +241,6 @@ def create_job(request:Request):
     job state, and enqueues the job ID for a separate worker process.
     """
     cache = request.app.state.cache
-    queue_size = cache.llen("jobs")
-
-    if queue_size >= settings.max_queue_size:
-        raise HTTPException(
-            status_code=429,
-            detail="Queue is full. retry later."
-        )
-    
-
     job_id = str(uuid.uuid4())
     job_key = f"job:{job_id}"
 
@@ -264,8 +258,7 @@ def create_job(request:Request):
         "max_attempts": 3,
     }
 
-    cache.set(job_key, json.dumps(job_data))
-    cache.lpush("jobs", job_id)
+    enqueue_job(cache, job_id, job_key, job_data)
 
     return {
         "job_id": job_id,
@@ -326,14 +319,6 @@ def get_dead_jobs_count(request: Request):
 @app.post("/inference")
 def create_inference_request(payload: InferenceRequest, request: Request):
     cache = request.app.state.cache
-    queue_size = cache.llen("jobs")
-
-    if queue_size >= settings.max_queue_size:
-        raise HTTPException(
-            status_code=429,
-            detail="Queue is full, try later"
-        )
-
     job_id = str(uuid.uuid4())
     job_key = f"job:{job_id}"
 
@@ -353,14 +338,31 @@ def create_inference_request(payload: InferenceRequest, request: Request):
         "max_attempts": 3,
     }
 
-    cache.set(job_key, json.dumps(job_data))
-    cache.lpush("jobs", job_id)
+    enqueue_job(cache, job_id, job_key, job_data)
 
     return {
         "job_id": job_id,
         "status": "queued",
         "type": "inference",
     }
+
+def enqueue_job(cache, job_id, job_key, job_data):
+    try:
+        cache.enqueue(
+            "jobs",
+            job_id,
+            job_key,
+            json.dumps(job_data),
+            settings.max_queue_size,
+        )
+    except CommandError as exc:
+        if exc.args and exc.args[0] == b"queue is full":
+            raise HTTPException(
+                status_code=429,
+                detail="Queue is full. Please retry later.",
+            )
+
+        raise
 
 
 

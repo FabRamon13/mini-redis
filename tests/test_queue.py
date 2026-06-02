@@ -1,25 +1,29 @@
-import sys
-from pathlib import Path
-
-sys.path.append(str(Path(__file__).resolve().parents[1]))
+import os
+import unittest
 
 from redis_clone.client import Client
 
 
-client = Client()
+@unittest.skipUnless(
+    os.getenv("RUN_INTEGRATION_TESTS") == "1",
+    "set RUN_INTEGRATION_TESTS=1 with a running Redis clone",
+)
+class QueueIntegrationTests(unittest.TestCase):
+    def setUp(self):
+        self.client = Client()
+        self.client.flush()
 
-print("Testing queue commands...")
-client.flush()
+    def tearDown(self):
+        self.client.close()
 
-assert client.llen("jobs") == 0
+    def test_lpush_and_rpop_are_fifo(self):
+        self.assertEqual(self.client.llen("jobs"), 0)
+        self.assertEqual(self.client.lpush("jobs", "job1"), 1)
+        self.assertEqual(self.client.lpush("jobs", "job2"), 2)
+        self.assertEqual(self.client.rpop("jobs"), b"job1")
+        self.assertEqual(self.client.rpop("jobs"), b"job2")
+        self.assertIsNone(self.client.rpop("jobs"))
 
-assert client.lpush("jobs", "job1") == 1
-assert client.lpush("jobs", "job2") == 2
 
-assert client.llen("jobs") == 2
-
-assert client.rpop("jobs") == b"job1"
-assert client.rpop("jobs") == b"job2"
-assert client.rpop("jobs") is None
-
-print("Queue tests passed.")
+if __name__ == "__main__":
+    unittest.main()

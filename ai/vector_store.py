@@ -1,33 +1,63 @@
 from ai.similarity import cosine_similarity
+
+
 class VectorStore:
-    def __init__(self):
-        self._entries =[]
+    def __init__(self, entries=None):
+        self.entries = entries or []
 
-    def add(self, prompt, embedding, response):
-        self._entries.append({
-            "prompt": prompt,
-            "embedding": embedding,
-            "response": response
-        })
+    def filter_entries(self, provider, model_id, model_revision, embedding_dimensions):
+        return [
+            entry
+            for entry in self.entries
+            if entry.get("provider") == provider
+            and entry.get("model_id") == model_id
+            and entry.get("model_revision") == model_revision
+            and entry.get("embedding_dimensions") == embedding_dimensions
+        ]
 
-    def all(self):
-        return self._entries
-    
-    def find_similar(self, embedding, threshold=0.75):
-        best_match = None
-        best_score = 0.0
+    def find_best_match(self, embedding, provider, model_id, model_revision, threshold):
+        matches = self.search_top_k(
+            embedding=embedding,
+            provider=provider,
+            model_id=model_id,
+            model_revision=model_revision,
+            k=1,
+        )
 
-        for entry in self._entries:
+        if not matches:
+            return None, 0.0
+
+        best = matches[0]
+
+        if best["similarity_score"] >= threshold:
+            return best["entry"], best["similarity_score"]
+
+        return None, best["similarity_score"]
+
+    def search_top_k(self, embedding, provider, model_id, model_revision, k=3):
+        candidates = self.filter_entries(
+            provider=provider,
+            model_id=model_id,
+            model_revision=model_revision,
+            embedding_dimensions=len(embedding),
+        )
+
+        scored = []
+
+        for entry in candidates:
             score = cosine_similarity(
                 embedding,
-                entry["embedding"]
+                entry["embedding"],
             )
 
-            if score > best_score:
-                best_score = score 
-                best_match = entry
-        
-        if best_match is not None and best_score >= threshold:
-            return best_match, best_score
-        
-        return None, best_score
+            scored.append({
+                "entry": entry,
+                "similarity_score": score,
+            })
+
+        scored.sort(
+            key=lambda item: item["similarity_score"],
+            reverse=True,
+        )
+
+        return scored[:k]

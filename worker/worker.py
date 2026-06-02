@@ -1,120 +1,106 @@
 import json
+import math
 import time
 import os
-import socket 
+import socket
+import uuid
+
 
 from redis_clone.client import Client
 from datetime import datetime, timezone
-from ai.embedding_router import get_embedding 
-from ai.vector_store import VectorStore
-from ai.similarity import cosine_similarity
-from ai.inference import generate_response
+from worker.semantic_cache import (
+    get_model_id,
+    get_model_revision,
+    get_semantic_cache_entries,
+    save_semantic_cache_entry,
+)
 from redis_clone.exceptions import Disconnect
+from ai.vector_store import VectorStore
+from ai.embedding_router import get_embedding
+from ai.inference import generate_response
 
-vector_store = VectorStore()
+def load_semantic_cache_threshold(value=None):
+    if value is None:
+        value = os.getenv("SEMANTIC_CACHE_THRESHOLD", "0.75")
+
+    try:
+        threshold = float(value)
+    except (TypeError, ValueError):
+        raise ValueError("SEMANTIC_CACHE_THRESHOLD must be a number")
+
+    if not math.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
+        raise ValueError("SEMANTIC_CACHE_THRESHOLD must be between 0.0 and 1.0")
+
+    return threshold
+
+def load_non_negative_float(name, default):
+    value = os.getenv(name, str(default))
+
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} must be a number")
+
+    if not math.isfinite(parsed) or parsed < 0:
+        raise ValueError(f"{name} must be a non-negative number")
+
+    return parsed
+
+def load_positive_int(name, default, value=None):
+    if value is None:
+        value = os.getenv(name, str(default))
+
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} must be an integer")
+
+    if parsed <= 0:
+        raise ValueError(f"{name} must be positive")
+
+    return parsed
+
+SEMANTIC_CACHE_THRESHOLD = load_semantic_cache_threshold()
+DEMO_TASK_DELAY_SECONDS = load_non_negative_float("DEMO_TASK_DELAY_SECONDS", 0.0)
+DEMO_INFERENCE_DELAY_SECONDS = load_non_negative_float("DEMO_INFERENCE_DELAY_SECONDS", 0.0)
+WORKER_LEASE_SECONDS = load_positive_int("WORKER_LEASE_SECONDS", 60)
+WORKER_RECOVERY_INTERVAL_SECONDS = load_positive_int(
+    "WORKER_RECOVERY_INTERVAL_SECONDS",
+    30,
+)
+SEMANTIC_CACHE_MAX_ENTRIES = load_positive_int("SEMANTIC_CACHE_MAX_ENTRIES", 1000)
+
 
 def increment_metric(client,key):
-    current = client.get(key)
-
-    if current is None:
-        client.set(key,"1")
-    else:
-        count = int(current.decode("utf-8"))
-        client.set(key,str(count+1))
+    return client.incr(key)
 
 def process_demo_task(job):
-    time.sleep(3)
+    time.sleep(DEMO_TASK_DELAY_SECONDS)
 
     return {
         "message": "Job completed successfully"
     }
 
-def get_semantic_cache_entries(client):
-    index_raw = client.get("semantic_cache:index")
-
-    if index_raw is None:
-        return []
-
-    keys = json.loads(index_raw.decode("utf-8"))
-    entries = []
-
-    for key in keys:
-        raw = client.get(key)
-
-        if raw is None:
-            continue
-
-        entry = json.loads(raw.decode("utf-8"))
-
-        if not isinstance(entry, dict):
-            continue
-
-        if not entry.get("prompt"):
-            continue
-
-        if not entry.get("embedding"):
-            continue
-
-        if not entry.get("response"):
-            continue
-
-        entries.append(entry)
-
-    return entries
-
-def save_semantic_cache_entry(client, prompt, embedding, response,provider):
-    cache_id = str(len(get_semantic_cache_entries(client)) + 1)
-    cache_key = f"semantic_cache:{cache_id}"
-
-    entry = {
-        "prompt": prompt,
-        "provider": provider,
-        "embedding": embedding,
-        "response": response,
-    }
-
-    client.set(cache_key, json.dumps(entry))
-
-    index_raw = client.get("semantic_cache:index")
-
-    if index_raw is None:
-        keys = []
-    else:
-        keys = json.loads(index_raw.decode("utf-8"))
-
-    keys.append(cache_key)
-
-    client.set("semantic_cache:index", json.dumps(keys))
-
 def process_inference(job,client):
     prompt = job["prompt"]
     provider = job.get("provider", "fake")
+    model_id = get_model_id(provider)
+    model_revision = get_model_revision(provider)
     vector = get_embedding(prompt, provider=provider)
 
     entries = get_semantic_cache_entries(client)
 
-    best_match = None
-    best_score = 0.0
+    vector_store = VectorStore(entries)
 
-    for entry in entries:
-        if entry is None:
-            continue
+    best_match, best_score = vector_store.find_best_match(
+        embedding=vector,
+        provider=provider,
+        model_id=model_id,
+        model_revision=model_revision,
+        threshold=SEMANTIC_CACHE_THRESHOLD,
+    )
 
-        if entry.get("provider", "fake") != provider:
-            continue
-
-        embedding = entry.get("embedding")
-
-        if embedding is None:
-            continue
-
-        score = cosine_similarity(vector, embedding)
-
-        if score > best_score:
-            best_score = score
-            best_match = entry
-
-    if best_match is not None and best_score >= 0.75:
+    if best_match is not None:
         increment_metric(client,"metrics:semantic_cache_hits")
         
         return {
@@ -128,12 +114,18 @@ def process_inference(job,client):
     
     increment_metric(client, "metrics:semantic_cache_misses")
 
-    ##only cache misses pay the expensie inference cost
-    time.sleep(3)
+    time.sleep(DEMO_INFERENCE_DELAY_SECONDS)
 
     response = generate_response(prompt, provider = provider)
 
-    save_semantic_cache_entry(client, prompt, vector, response,provider)
+    save_semantic_cache_entry(
+        client,
+        prompt,
+        vector,
+        response,
+        provider,
+        SEMANTIC_CACHE_MAX_ENTRIES,
+    )
     
     return {
         "prompt": prompt,
@@ -154,24 +146,232 @@ def process_job(job,client):
 
     raise ValueError(f"Unknown job type: {job_type}")
 
+def process_claimed_job(client, job_id, worker_id, claim_token="", claimed_at=None):
+    job_key = f"job:{job_id}"
+    job_raw = client.get(job_key)
+
+    if job_raw is None:
+        client.ack("processing_jobs", job_id, claim_token)
+        return
+
+    job = json.loads(job_raw.decode("utf-8"))
+    job["status"] = "running"
+    job["started_at"] = now_iso()
+    job["claimed_at"] = claimed_at or now_iso()
+    job["lease_seconds"] = WORKER_LEASE_SECONDS
+    job["worker_id"] = worker_id
+    job["claim_token"] = claim_token
+
+    if not client.update_claim(job_id, job_key, json.dumps(job), claim_token):
+        return
+
+    print(f"Processing job {job_id}")
+
+    try:
+        result = process_job(job, client)
+
+        job["status"] = "completed"
+        job["completed_at"] = now_iso()
+        job["failed_at"] = None
+        job["error"] = None
+        job["result"] = result
+
+        finished = client.finish(
+            "processing_jobs",
+            "",
+            job_id,
+            job_key,
+            json.dumps(job),
+            claim_token,
+        )
+
+        if finished:
+            increment_metric(client, "metrics:processed_jobs")
+
+    except Exception as exc:
+        job["attempts"] +=1
+        job["error"] = str(exc)
+
+        if job["attempts"] < job["max_attempts"]:
+            job["status"] = "queued"
+            job["worker_id"] = None
+            job["claim_token"] = None
+            job["claimed_at"] = None
+            job["started_at"] = None
+            client.requeue(
+                "processing_jobs",
+                "jobs",
+                job_id,
+                job_key,
+                json.dumps(job),
+                claim_token,
+            )
+            return
+
+        job["status"] = "failed"
+        job["failed_at"] = now_iso()
+        job["result"] = None
+
+        finished = client.finish(
+            "processing_jobs",
+            "dead_jobs",
+            job_id,
+            job_key,
+            json.dumps(job),
+            claim_token,
+        )
+
+        if finished:
+            increment_metric(client, "metrics:failed_jobs")
+
+def parse_iso(value):
+    if not isinstance(value, str):
+        return None
+
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+
+    return parsed
+
+def recover_stale_processing_jobs(client, now=None):
+    job_ids = client.lrange("processing_jobs", 0, -1)
+
+    if not job_ids:
+        return 0
+
+    recovered = 0
+    now = now or datetime.now(timezone.utc)
+
+    for raw_job_id in job_ids:
+        try:
+            job_id = (
+                raw_job_id.decode("utf-8")
+                if isinstance(raw_job_id, bytes)
+                else str(raw_job_id)
+            )
+        except UnicodeDecodeError:
+            print("Skipping processing job with invalid UTF-8 ID", flush=True)
+            continue
+
+        job_key = f"job:{job_id}"
+        claim = _load_claim(client, job_id)
+        claim_token = claim.get("claim_token", "")
+        raw_job = client.get(job_key)
+
+        if raw_job is None:
+            client.ack("processing_jobs", job_id, claim_token)
+            continue
+
+        try:
+            job = json.loads(raw_job.decode("utf-8"))
+        except (AttributeError, UnicodeDecodeError, json.JSONDecodeError):
+            print(f"Skipping processing job {job_id}: invalid metadata", flush=True)
+            continue
+
+        if not isinstance(job, dict):
+            print(f"Skipping processing job {job_id}: invalid metadata", flush=True)
+            continue
+
+        claimed_at = parse_iso(claim.get("claimed_at") or job.get("claimed_at"))
+
+        try:
+            lease_seconds = load_positive_int(
+                "lease_seconds",
+                WORKER_LEASE_SECONDS,
+                claim.get("lease_seconds", job.get("lease_seconds", WORKER_LEASE_SECONDS)),
+            )
+        except ValueError:
+            print(f"Skipping processing job {job_id}: invalid lease", flush=True)
+            continue
+
+        if claimed_at is None:
+            print(f"Skipping processing job {job_id}: missing valid claim timestamp", flush=True)
+            continue
+
+        if (now - claimed_at).total_seconds() <= lease_seconds:
+            continue
+
+        job["status"] = "queued"
+        job["worker_id"] = None
+        job["claim_token"] = None
+        job["claimed_at"] = None
+        job["started_at"] = None
+        job["error"] = "Recovered from stale worker claim"
+
+        removed = client.requeue(
+            "processing_jobs",
+            "jobs",
+            job_id,
+            job_key,
+            json.dumps(job),
+            claim_token,
+        )
+
+        if removed:
+            recovered += 1
+
+    return recovered
+
+def _load_claim(client, job_id):
+    raw_claim = client.get(f"worker_claim:{job_id}")
+
+    if raw_claim is None:
+        return {}
+
+    try:
+        claim = json.loads(raw_claim.decode("utf-8"))
+    except (AttributeError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+
+    return claim if isinstance(claim, dict) else {}
+
 def main():
     client = connect_with_retry()
 
-    worker_id = socket.gethostname()
+    worker_id = f"{socket.gethostname()}:{os.getpid()}"
+    recovered = recover_stale_processing_jobs(client)
+    last_recovery = time.monotonic()
+
+    print(f"Recovered {recovered} stale processing jobs", flush=True)
     print(f"Worker {worker_id} started. Waiting for jobs..", flush =True)
 
     while True:
         try:
-            job_id = client.rpop("jobs")
+            if time.monotonic() - last_recovery >= WORKER_RECOVERY_INTERVAL_SECONDS:
+                recovered = recover_stale_processing_jobs(client)
+                last_recovery = time.monotonic()
+
+                if recovered:
+                    print(f"Recovered {recovered} stale processing jobs", flush=True)
+
+            claimed_at = now_iso()
+            claim_token = str(uuid.uuid4())
+            job_id = client.claim(
+                "jobs",
+                "processing_jobs",
+                worker_id,
+                claim_token,
+                claimed_at,
+                WORKER_LEASE_SECONDS,
+            )
 
         except Disconnect:
             print("Lost redis connection, reconnecting", flush=True)
             client = connect_with_retry()
+            recovered = recover_stale_processing_jobs(client)
+            last_recovery = time.monotonic()
             continue
         
         except OSError:
             print("socket error, reconnecting", flush=True)
             client = connect_with_retry()
+            recovered = recover_stale_processing_jobs(client)
+            last_recovery = time.monotonic()
             continue
 
         if job_id is None:
@@ -179,55 +379,7 @@ def main():
             continue
 
         job_id = job_id.decode("utf-8")
-        job_key = f"job:{job_id}"
-
-        job_raw = client.get(job_key)
-
-        if job_raw is None:
-            continue
-
-        job = json.loads(job_raw.decode("utf-8"))
-
-        job["status"] = "running"
-        job["started_at"] = now_iso()
-        job["worker_id"] = worker_id
-        client.set(job_key, json.dumps(job))
-
-        print(f"Processing job {job_id}")
-
-        try:            
-            result = process_job(job, client)
-
-            job["status"] = "completed"
-            job["completed_at"] = now_iso()
-            job["failed_at"] = None
-            job["error"] = None
-            job["result"] = result
-
-            increment_metric(client, "metrics:processed_jobs")
-
-        except Exception as exc:
-            job["attempts"] +=1
-            job["error"] = str(exc)
-
-            if job["attempts"] < job["max_attempts"]:
-                job["status"] = "queued"
-                client.set(job_key,json.dumps(job))
-                client.lpush("jobs", job_id)
-                continue
-            
-            else:
-                job["status"] = "failed"
-                job["failed_at"] = now_iso()
-                job["result"] = None
-                job["error"] = str(exc)
-
-                client.set(job_key,json.dumps(job))
-                client.lpush("dead_jobs", job_id)
-                increment_metric(client, "metrics:failed_jobs")
-                continue
-
-        client.set(job_key, json.dumps(job))
+        process_claimed_job(client, job_id, worker_id, claim_token, claimed_at)
 
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
