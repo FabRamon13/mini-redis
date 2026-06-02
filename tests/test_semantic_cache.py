@@ -285,6 +285,75 @@ class SemanticCacheTests(unittest.TestCase):
         self.assertEqual(result["cache"], "miss")
         self.assertEqual(result["response"], {"answer": "fresh"})
 
+    def test_process_inference_hit_includes_formatted_top_matches(self):
+        client = MemoryClient()
+        entry_id = save_semantic_cache_entry(
+            client,
+            "cached prompt",
+            [1.0, 0.0],
+            {"answer": "cached"},
+            "fake",
+        )
+
+        with patch("worker.worker.get_embedding", return_value=[1.0, 0.0]):
+            result = process_inference({"prompt": "new prompt", "provider": "fake"}, client)
+
+        self.assertEqual(result["cache"], "hit")
+        self.assertEqual(
+            result["top_matches"],
+            [{
+                "entry_id": entry_id,
+                "prompt": "cached prompt",
+                "provider": "fake",
+                "model_id": "hash-embedding-v1",
+                "model_revision": "v1",
+                "similarity_score": 1.0,
+            }],
+        )
+
+    def test_process_inference_miss_includes_below_threshold_top_matches(self):
+        client = MemoryClient()
+        entry_id = save_semantic_cache_entry(
+            client,
+            "different prompt",
+            [0.0, 1.0],
+            {"answer": "cached"},
+            "fake",
+        )
+
+        with (
+            patch("worker.worker.get_embedding", return_value=[1.0, 0.0]),
+            patch("worker.worker.generate_response", return_value={"answer": "fresh"}),
+            patch("worker.worker.time.sleep"),
+        ):
+            result = process_inference({"prompt": "new prompt", "provider": "fake"}, client)
+
+        self.assertEqual(result["cache"], "miss")
+        self.assertEqual(
+            result["top_matches"],
+            [{
+                "entry_id": entry_id,
+                "prompt": "different prompt",
+                "provider": "fake",
+                "model_id": "hash-embedding-v1",
+                "model_revision": "v1",
+                "similarity_score": 0.0,
+            }],
+        )
+
+    def test_process_inference_empty_cache_includes_empty_top_matches(self):
+        client = MemoryClient()
+
+        with (
+            patch("worker.worker.get_embedding", return_value=[1.0, 0.0]),
+            patch("worker.worker.generate_response", return_value={"answer": "fresh"}),
+            patch("worker.worker.time.sleep"),
+        ):
+            result = process_inference({"prompt": "new prompt", "provider": "fake"}, client)
+
+        self.assertEqual(result["cache"], "miss")
+        self.assertEqual(result["top_matches"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

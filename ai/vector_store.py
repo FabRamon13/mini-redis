@@ -35,13 +35,15 @@ class VectorStore:
         return None, best["similarity_score"]
 
     def search_top_k(self, embedding, provider, model_id, model_revision, k=3):
+        if isinstance(k, bool) or not isinstance(k, int) or k <= 0:
+            raise ValueError("k must be a positive integer")
+
         candidates = self.filter_entries(
             provider=provider,
             model_id=model_id,
             model_revision=model_revision,
             embedding_dimensions=len(embedding),
         )
-
         scored = []
 
         for entry in candidates:

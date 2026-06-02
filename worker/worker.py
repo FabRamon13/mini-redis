@@ -92,24 +92,40 @@ def process_inference(job,client):
 
     vector_store = VectorStore(entries)
 
-    best_match, best_score = vector_store.find_best_match(
+    top_matches = vector_store.search_top_k(
         embedding=vector,
         provider=provider,
         model_id=model_id,
         model_revision=model_revision,
-        threshold=SEMANTIC_CACHE_THRESHOLD,
+        k=3,
     )
 
-    if best_match is not None:
+    formatted_top_matches = [
+        {
+            "entry_id": item["entry"].get("entry_id"),
+            "prompt": item["entry"].get("prompt"),
+            "provider": item["entry"].get("provider"),
+            "model_id": item["entry"].get("model_id"),
+            "model_revision": item["entry"].get("model_revision"),
+            "similarity_score": round(item["similarity_score"], 4),
+        }
+        for item in top_matches
+    ]
+
+    best_match = top_matches[0] if top_matches else None
+    best_score = best_match["similarity_score"] if best_match else 0.0
+
+    if best_match is not None and best_score >= SEMANTIC_CACHE_THRESHOLD:
         increment_metric(client,"metrics:semantic_cache_hits")
-        
+
         return {
             "prompt": prompt,
             "provider": provider,
             "cache": "hit",
-            "matched_prompt": best_match["prompt"],
+            "matched_prompt": best_match["entry"]["prompt"],
             "similarity_score": round(best_score, 4),
-            "response": best_match["response"],
+            "top_matches": formatted_top_matches,
+            "response": best_match["entry"]["response"],
         }
     
     increment_metric(client, "metrics:semantic_cache_misses")
@@ -132,6 +148,7 @@ def process_inference(job,client):
         "provider": provider,
         "cache": "miss",
         "similarity_score": round(best_score, 4),
+        "top_matches": formatted_top_matches,
         "embedding_dimensions": len(vector),
         "response": response,
     }
