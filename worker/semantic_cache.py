@@ -2,6 +2,7 @@ import json
 import math
 import uuid
 from datetime import datetime, timezone
+import heapq
 
 
 def now_iso():

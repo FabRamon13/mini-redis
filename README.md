@@ -574,5 +574,50 @@ This prevents resource leaks and prepares the system for future distributed depl
 * Distributed worker scaling
 * Monitoring dashboards
 
+---
+
+## FAISS Boundary
+
+Redis Clone remains the source of truth.
+
+Redis stores:
+
+- prompt
+- provider
+- model_id
+- model_revision
+- embedding_dimensions
+- embedding
+- response
+- semantic cache metadata
+- job state
+- queue state
+
+FAISS stores:
+
+- vectors for nearest-neighbor search
+- integer index IDs mapped to semantic cache entries
+
+FAISS does not own durable state.
+
+If the FAISS index is lost, corrupted, or restarted, it should be rebuilt from Redis semantic cache entries.
+
+### Rebuild Flow
+
+```text
+Worker starts
+↓
+Read semantic_cache:index from Redis Clone
+↓
+Load semantic_cache:<uuid> entries
+↓
+Validate provider/model/dimensions
+↓
+Insert embeddings into FAISS
+↓
+Build faiss_id → entry_id mapping
+
 ```
 ```
+
+

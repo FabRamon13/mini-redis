@@ -1,5 +1,5 @@
 from ai.similarity import cosine_similarity
-
+import heapq
 
 class VectorStore:
     def __init__(self, entries=None):
@@ -57,9 +57,9 @@ class VectorStore:
                 "similarity_score": score,
             })
 
-        scored.sort(
-            key=lambda item: item["similarity_score"],
-            reverse=True,
-        )
 
-        return scored[:k]
+        return heapq.nlargest(
+            k,
+            scored,
+            key=lambda item: item["similarity_score"],
+        )
