@@ -1,4 +1,6 @@
 import json
+import threading
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
@@ -6,6 +8,7 @@ from unittest.mock import patch
 from worker.worker import load_positive_int
 from worker.worker import process_claimed_job
 from worker.worker import recover_stale_processing_jobs
+from worker.worker import start_claim_heartbeat
 
 
 class MemoryQueueClient:
@@ -48,11 +51,33 @@ class MemoryQueueClient:
 
         return items[start:stop + 1]
 
+    def llen(self, key):
+        return len(self.lists.get(key, []))
+
+    def _claim_token_matches(self, job_id, claim_token):
+        raw_claim = self.data.get(f"worker_claim:{job_id}")
+
+        if raw_claim is None:
+            return False
+
+        try:
+            claim = json.loads(raw_claim)
+        except json.JSONDecodeError:
+            return False
+
+        return claim.get("claim_token") == claim_token
+
     def ack(self, key, value, claim_token=""):
+        if not self._claim_token_matches(value, claim_token):
+            return 0
+
         self.data.pop(f"worker_claim:{value}", None)
         return self.lrem(key, value)
 
     def requeue(self, source, destination, job_id, job_key, job_payload, claim_token=""):
+        if not self._claim_token_matches(job_id, claim_token):
+            return 0
+
         removed = self.lrem(source, job_id)
 
         if not removed:
@@ -68,6 +93,9 @@ class MemoryQueueClient:
         return removed
 
     def finish(self, source, destination, job_id, job_key, job_payload, claim_token=""):
+        if not self._claim_token_matches(job_id, claim_token):
+            return 0
+
         removed = self.lrem(source, job_id)
 
         if not removed:
@@ -84,6 +112,22 @@ class MemoryQueueClient:
         return removed
 
     def update_claim(self, job_id, job_key, job_payload, claim_token=""):
+        claim_key = f"worker_claim:{job_id}"
+        raw_claim = self.data.get(claim_key)
+
+        if raw_claim is None:
+            return 0
+
+        claim = json.loads(raw_claim)
+
+        if claim.get("claim_token") != claim_token:
+            return 0
+
+        job = json.loads(job_payload)
+        claim["claimed_at"] = job.get("claimed_at", claim.get("claimed_at"))
+        claim["lease_seconds"] = job.get("lease_seconds", claim.get("lease_seconds"))
+        claim["worker_id"] = job.get("worker_id", claim.get("worker_id"))
+        self.data[claim_key] = json.dumps(claim)
         self.data[job_key] = job_payload
         return 1
 
@@ -106,6 +150,12 @@ class WorkerClaimTests(unittest.TestCase):
     def make_client(self, job=None):
         client = MemoryQueueClient()
         client.lpush("processing_jobs", "job-1")
+        client.set("worker_claim:job-1", json.dumps({
+            "worker_id": "worker-1",
+            "claim_token": "",
+            "claimed_at": datetime.now(timezone.utc).isoformat(),
+            "lease_seconds": 60,
+        }))
 
         if job is not None:
             client.set("job:job-1", json.dumps(job))
@@ -163,6 +213,12 @@ class WorkerLeaseRecoveryTests(unittest.TestCase):
     def make_client(self, claimed_at, lease_seconds=60):
         client = MemoryQueueClient()
         client.lpush("processing_jobs", "job-1")
+        client.set("worker_claim:job-1", json.dumps({
+            "worker_id": "worker-1",
+            "claim_token": "claim-1",
+            "claimed_at": claimed_at,
+            "lease_seconds": lease_seconds,
+        }))
         client.set("job:job-1", json.dumps({
             "id": "job-1",
             "status": "running",
@@ -172,6 +228,14 @@ class WorkerLeaseRecoveryTests(unittest.TestCase):
             "started_at": claimed_at,
         }))
         return client
+
+    def set_claim(self, client, claimed_at, claim_token="claim-1", lease_seconds=60):
+        client.set("worker_claim:job-1", json.dumps({
+            "worker_id": "worker-1",
+            "claim_token": claim_token,
+            "claimed_at": claimed_at,
+            "lease_seconds": lease_seconds,
+        }))
 
     def test_positive_int_loader_accepts_positive_integer(self):
         self.assertEqual(load_positive_int("LEASE", 60, "2"), 2)
@@ -261,6 +325,85 @@ class WorkerLeaseRecoveryTests(unittest.TestCase):
 
         self.assertEqual(recover_stale_processing_jobs(client, now=now), 0)
         self.assertEqual(client.lists["processing_jobs"], ["job-1"])
+
+    def test_heartbeat_refreshes_claimed_at(self):
+        old_claimed_at = datetime(2026, 1, 1, tzinfo=timezone.utc).isoformat()
+        client = self.make_client(old_claimed_at)
+        self.set_claim(client, old_claimed_at)
+        job = json.loads(client.data["job:job-1"])
+        stop_event = threading.Event()
+
+        heartbeat_thread = start_claim_heartbeat(
+            client,
+            job,
+            "job-1",
+            "job:job-1",
+            "claim-1",
+            stop_event,
+            interval_seconds=0.01,
+        )
+
+        time.sleep(0.05)
+        stop_event.set()
+        heartbeat_thread.join(timeout=1)
+
+        persisted_job = json.loads(client.data["job:job-1"])
+        persisted_claim = json.loads(client.data["worker_claim:job-1"])
+
+        self.assertNotEqual(persisted_job["claimed_at"], old_claimed_at)
+        self.assertEqual(persisted_claim["claimed_at"], persisted_job["claimed_at"])
+
+    def test_wrong_claim_token_cannot_heartbeat(self):
+        old_claimed_at = datetime(2026, 1, 1, tzinfo=timezone.utc).isoformat()
+        client = self.make_client(old_claimed_at)
+        self.set_claim(client, old_claimed_at, claim_token="claim-1")
+        job = json.loads(client.data["job:job-1"])
+        stop_event = threading.Event()
+
+        heartbeat_thread = start_claim_heartbeat(
+            client,
+            job,
+            "job-1",
+            "job:job-1",
+            "wrong-token",
+            stop_event,
+            interval_seconds=0.01,
+        )
+
+        time.sleep(0.05)
+        stop_event.set()
+        heartbeat_thread.join(timeout=1)
+
+        persisted_job = json.loads(client.data["job:job-1"])
+        persisted_claim = json.loads(client.data["worker_claim:job-1"])
+
+        self.assertEqual(persisted_job["claimed_at"], old_claimed_at)
+        self.assertEqual(persisted_claim["claimed_at"], old_claimed_at)
+
+    def test_recovery_does_not_requeue_job_after_heartbeat_refresh(self):
+        now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        old_claimed_at = (now - timedelta(seconds=70)).isoformat()
+        fresh_claimed_at = now.isoformat()
+        client = self.make_client(old_claimed_at, lease_seconds=60)
+        self.set_claim(client, old_claimed_at, lease_seconds=60)
+        job = json.loads(client.data["job:job-1"])
+        job["claimed_at"] = fresh_claimed_at
+
+        self.assertEqual(
+            client.update_claim(
+                "job-1",
+                "job:job-1",
+                json.dumps(job),
+                "claim-1",
+            ),
+            1,
+        )
+
+        recovered = recover_stale_processing_jobs(client, now=now)
+
+        self.assertEqual(recovered, 0)
+        self.assertEqual(client.llen("processing_jobs"), 1)
+        self.assertEqual(client.llen("jobs"), 0)
 
 
 if __name__ == "__main__":

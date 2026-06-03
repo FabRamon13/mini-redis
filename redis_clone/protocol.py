@@ -6,6 +6,9 @@ from redis_clone.exceptions import CommandError, Disconnect
 
 Error = namedtuple("Error", ("message",))
 
+MAX_BULK_BYTES = 1024 * 1024
+MAX_ARRAY_LENGTH = 1024
+
 
 class ProtocolHandler:
     def __init__(self):
@@ -111,6 +114,9 @@ class ProtocolHandler:
         if length < -1:
             raise CommandError("Invalid bulk string length")
 
+        if length > MAX_BULK_BYTES:
+            raise CommandError("Bulk string too large")
+
         payload = socket_file.read(length)
         terminator = socket_file.read(2)
 
@@ -120,7 +126,21 @@ class ProtocolHandler:
         return payload
 
     def handle_array(self, socket_file):
-        num_elements = int(socket_file.readline().rstrip(b"\r\n"))
+        length_line = socket_file.readline()
+
+        if not length_line:
+            raise CommandError("Missing array length")
+
+        try:
+            num_elements = int(length_line.rstrip(b"\r\n"))
+        except ValueError:
+            raise CommandError("Invalid array length")
+
+        if num_elements < 0:
+            raise CommandError("Invalid array length")
+
+        if num_elements > MAX_ARRAY_LENGTH:
+            raise CommandError("Array too large")
 
         return [
             self.handle_request(socket_file)

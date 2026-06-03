@@ -12,6 +12,7 @@ from redis_clone.client import Client
 from redis_clone.exceptions import CommandError
 from fastapi_cache.fake_db import FAKE_DB
 from fastapi_cache.config import Settings
+from fastapi.responses import PlainTextResponse
 from typing import Literal
 
 class InferenceRequest(BaseModel):
@@ -274,8 +275,41 @@ def get_job_metrics(request: Request):
     semantic_hits = cache.get("metrics:semantic_cache_hits")
     semantic_misses = cache.get("metrics:semantic_cache_misses")
 
-    semantic_hits_count = int(semantic_hits.decode("utf-8")) if semantic_hits else 0
-    semantic_misses_count = int(semantic_misses.decode("utf-8")) if semantic_misses else 0
+    faiss_search_count = cache.get("metrics:faiss_search_count")
+    linear_search_count = cache.get("metrics:linear_search_count")
+
+    faiss_search_count = decode_counter(faiss_search_count)
+    linear_search_count = decode_counter(linear_search_count)
+    provider_call_count = cache.get("metrics:provider_call_count")
+    provider_call_count = decode_counter(provider_call_count)
+
+    faiss_search_latency_total = cache.get("metrics:faiss_search_latency_ms_total")
+    linear_search_latency_total = cache.get("metrics:linear_search_latency_ms_total")
+    provider_latency_total = cache.get("metrics:provider_latency_ms_total")
+
+    faiss_search_latency_ms_total = decode_counter(faiss_search_latency_total)
+    linear_search_latency_ms_total = decode_counter(linear_search_latency_total)
+    provider_latency_ms_total = decode_counter(provider_latency_total)
+    faiss_search_latency_ms_avg = (
+        faiss_search_latency_ms_total / faiss_search_count
+        if faiss_search_count
+        else 0
+    )
+    linear_search_latency_ms_avg = (
+        linear_search_latency_ms_total / linear_search_count
+        if linear_search_count
+        else 0
+    )
+    provider_latency_ms_avg = (
+        provider_latency_ms_total / provider_call_count
+        if provider_call_count
+        else 0
+    )
+
+    processed_count = decode_counter(processed)
+
+    semantic_hits_count = decode_counter(semantic_hits)
+    semantic_misses_count = decode_counter(semantic_misses)
 
     total_semantic_requests = semantic_hits_count + semantic_misses_count
 
@@ -287,14 +321,37 @@ def get_job_metrics(request: Request):
 
     return {
         "queued_jobs": cache.llen("jobs"),
+        "processing_jobs": cache.llen("processing_jobs"),
         "dead_jobs": cache.llen("dead_jobs"),
-        "processed_jobs": int(processed.decode("utf-8")) if processed else 0,
-        "failed_jobs": int(failed.decode("utf-8")) if failed else 0,
+        "processed_jobs": processed_count,
+        "failed_jobs": decode_counter(failed),
         "max_queue_size": settings.max_queue_size,
         "semantic_cache_hits": semantic_hits_count,
         "semantic_cache_misses": semantic_misses_count,
         "semantic_cache_hit_rate": round(semantic_hit_rate,4),
+        "faiss_search_count": faiss_search_count,
+        "faiss_search_latency_ms_total": faiss_search_latency_ms_total,
+        "faiss_search_latency_ms_avg": round(faiss_search_latency_ms_avg, 2),
+        "linear_search_count": linear_search_count,
+        "linear_search_latency_ms_total": linear_search_latency_ms_total,
+        "linear_search_latency_ms_avg": round(linear_search_latency_ms_avg, 2),
+        "provider_call_count": provider_call_count,
+        "provider_latency_ms_total": provider_latency_ms_total,
+        "provider_latency_ms_avg": round(provider_latency_ms_avg, 2),
     }
+
+@app.get("/metrics", response_class=PlainTextResponse)
+def prometheus_metrics(request: Request):
+    data = get_job_metrics(request)
+
+    lines = []
+
+    for key, value in data.items():
+        if isinstance(value, (int, float)):
+            lines.append(f"mini_redis_{key} {value}")
+
+    return "\n".join(lines) + "\n"
+
 
 @app.get("/jobs/{job_id}")
 def get_job(job_id: str, request: Request):
@@ -346,6 +403,7 @@ def create_inference_request(payload: InferenceRequest, request: Request):
         "type": "inference",
     }
 
+
 def enqueue_job(cache, job_id, job_key, job_data):
     try:
         cache.enqueue(
@@ -365,6 +423,14 @@ def enqueue_job(cache, job_id, job_key, job_data):
         raise
 
 
+def decode_counter(raw, default=0):
+    if raw is None:
+        return default
+
+    try:
+        return int(raw.decode("utf-8"))
+    except (AttributeError, UnicodeDecodeError, ValueError):
+        return default
 
 
 def now_iso():
