@@ -4,6 +4,7 @@ import time
 import os
 import socket
 import uuid
+import threading
 
 
 from redis_clone.client import Client
@@ -63,19 +64,35 @@ def load_positive_int(name, default, value=None):
 
     return parsed
 
-SEMANTIC_CACHE_THRESHOLD = load_semantic_cache_threshold()
+def load_vector_search_engine(value=None):
+    if value is None:
+        value = os.getenv("VECTOR_SEARCH_ENGINE", "faiss")
+
+    engine = value.lower()
+
+    if engine not in {"linear", "faiss"}:
+        raise ValueError("VECTOR_SEARCH_ENGINE must be 'linear' or 'faiss'")
+
+    return engine
+
 DEMO_TASK_DELAY_SECONDS = load_non_negative_float("DEMO_TASK_DELAY_SECONDS", 0.0)
 DEMO_INFERENCE_DELAY_SECONDS = load_non_negative_float("DEMO_INFERENCE_DELAY_SECONDS", 0.0)
+
 WORKER_LEASE_SECONDS = load_positive_int("WORKER_LEASE_SECONDS", 60)
-WORKER_RECOVERY_INTERVAL_SECONDS = load_positive_int(
-    "WORKER_RECOVERY_INTERVAL_SECONDS",
-    30,
-)
+WORKER_RECOVERY_INTERVAL_SECONDS = load_positive_int("WORKER_RECOVERY_INTERVAL_SECONDS",30,)
+WORKER_HEARTBEAT_INTERVAL_SECONDS = load_positive_int("WORKER_HEARTBEAT_INTERVAL_SECONDS", 15)
+
+SEMANTIC_CACHE_THRESHOLD = load_semantic_cache_threshold()
 SEMANTIC_CACHE_MAX_ENTRIES = load_positive_int("SEMANTIC_CACHE_MAX_ENTRIES", 1000)
+VECTOR_SEARCH_ENGINE = load_vector_search_engine()
 
 
-def increment_metric(client,key):
+def increment_metric(client, key):
     return client.incr(key)
+
+def increment_metric_by(client, key, amount):
+    return client.incrby(key, int(amount))
+
 
 def process_demo_task(job):
     time.sleep(DEMO_TASK_DELAY_SECONDS)
@@ -92,9 +109,19 @@ def process_inference(job,client):
     vector = get_embedding(prompt, provider=provider)
 
     entries = get_semantic_cache_entries(client)
-    vector_store = VectorStore(entries)
 
-    if provider == "huggingface":
+    use_faiss = (
+        provider == "huggingface"
+        and VECTOR_SEARCH_ENGINE == "faiss"
+    )
+    search_engine = "faiss" if use_faiss else "linear"
+
+    print(
+        f"Search engine={search_engine} provider={provider}",
+        flush=True,
+    )
+
+    if use_faiss:
         faiss_store = get_faiss_index(
             entries=entries,
             provider=provider,
@@ -103,11 +130,27 @@ def process_inference(job,client):
             dimensions=len(vector),
         )
 
+        search_start = time.perf_counter()
+
         top_matches = faiss_store.search_top_k(
             embedding=vector,
             k=3,
         )
+        search_latency_ms = int((time.perf_counter() - search_start) * 1000)
+
+        increment_metric(client, "metrics:faiss_search_count")
+        increment_metric_by(client, "metrics:faiss_search_latency_ms_total", search_latency_ms)
+
+        print(
+            f"FAISS search latency={search_latency_ms}ms",
+            flush=True,
+        )
+
     else:
+        vector_store = VectorStore(entries)
+
+        search_start = time.perf_counter()
+
         top_matches = vector_store.search_top_k(
             embedding=vector,
             provider=provider,
@@ -116,6 +159,15 @@ def process_inference(job,client):
             k=3,
         )
 
+        search_latency_ms = int((time.perf_counter() - search_start) * 1000)
+
+        increment_metric(client, "metrics:linear_search_count")
+        increment_metric_by(client, "metrics:linear_search_latency_ms_total", search_latency_ms)
+
+        print(
+            f"Linear search latency={search_latency_ms}ms",
+            flush=True,
+        )
 
     formatted_top_matches = [
         {
@@ -149,7 +201,14 @@ def process_inference(job,client):
 
     time.sleep(DEMO_INFERENCE_DELAY_SECONDS)
 
+    provider_start = time.perf_counter()
+
     response = generate_response(prompt, provider = provider)
+
+    provider_latency_ms = int((time.perf_counter() - provider_start) * 1000)
+
+    increment_metric(client, "metrics:provider_call_count")
+    increment_metric_by(client, "metrics:provider_latency_ms_total", provider_latency_ms)
 
     saved_entry = save_semantic_cache_entry(
         client,
@@ -160,7 +219,7 @@ def process_inference(job,client):
         SEMANTIC_CACHE_MAX_ENTRIES,
     )
 
-    if provider == "huggingface":
+    if use_faiss:
         add_to_faiss(saved_entry)
     
     return {
@@ -201,6 +260,10 @@ def process_claimed_job(client, job_id, worker_id, claim_token="", claimed_at=No
 
     if not client.update_claim(job_id, job_key, json.dumps(job), claim_token):
         return
+
+    stop_heartbeat=threading.Event()
+    heartbeat_thread = start_claim_heartbeat(client,job,job_id,job_key,claim_token,stop_heartbeat)
+
 
     print(f"Processing job {job_id}")
 
@@ -260,6 +323,9 @@ def process_claimed_job(client, job_id, worker_id, claim_token="", claimed_at=No
 
         if finished:
             increment_metric(client, "metrics:failed_jobs")
+    finally:
+        stop_heartbeat.set()
+        heartbeat_thread.join(timeout=1)
 
 def parse_iso(value):
     if not isinstance(value, str):
@@ -274,6 +340,24 @@ def parse_iso(value):
         return None
 
     return parsed
+
+def start_claim_heartbeat(client,job,job_id,job_key,claim_token,stop_event,interval_seconds=WORKER_HEARTBEAT_INTERVAL_SECONDS):
+    def heartbeat_loop():
+        while not stop_event.wait(interval_seconds):
+            job["claimed_at"] = now_iso()
+            updated = client.update_claim(
+                job_id,
+                job_key,
+                json.dumps(job),
+                claim_token,
+            )
+
+            if not updated:
+                break
+
+    thread = threading.Thread(target=heartbeat_loop, daemon=True)
+    thread.start()
+    return thread
 
 def recover_stale_processing_jobs(client, now=None):
     job_ids = client.lrange("processing_jobs", 0, -1)
@@ -301,7 +385,7 @@ def recover_stale_processing_jobs(client, now=None):
         raw_job = client.get(job_key)
 
         if raw_job is None:
-            client.ack("processing_jobs", job_id, claim_token)
+            client.lrem("processing_jobs", job_id)
             continue
 
         try:
@@ -368,6 +452,9 @@ def _load_claim(client, job_id):
     return claim if isinstance(claim, dict) else {}
 
 def rebuild_worker_faiss_indexes(client):
+    if VECTOR_SEARCH_ENGINE != "faiss":
+        return 0
+
     entries = get_semantic_cache_entries(client)
     return rebuild_faiss_indexes(entries, provider="huggingface")
 

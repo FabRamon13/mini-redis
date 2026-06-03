@@ -118,3 +118,5 @@ class Client:
             job_payload,
             str(max_size),
         )
+    def incrby(self, key, amount):
+        return self.execute("INCRBY", key, str(amount))

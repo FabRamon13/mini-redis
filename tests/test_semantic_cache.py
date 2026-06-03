@@ -1,12 +1,16 @@
 import json
 import unittest
 import uuid
+from unittest.mock import Mock
 from unittest.mock import patch
 
 from worker.worker import load_non_negative_float
 from worker.worker import load_semantic_cache_threshold
+from worker.worker import load_vector_search_engine
 from worker.worker import process_inference
+from worker.worker import rebuild_worker_faiss_indexes
 from worker.faiss_index import get_faiss_index
+from worker.faiss_index import get_faiss_index_size
 from worker.faiss_index import reset_faiss_indexes
 from worker.semantic_cache import get_model_id
 from worker.semantic_cache import get_semantic_cache_entries
@@ -29,6 +33,11 @@ class MemoryClient:
 
     def incr(self, key):
         value = int(self.data.get(key, "0")) + 1
+        self.data[key] = str(value)
+        return value
+
+    def incrby(self, key, amount):
+        value = int(self.data.get(key, "0")) + int(amount)
         self.data[key] = str(value)
         return value
 
@@ -59,6 +68,54 @@ class MemoryClient:
         return removed
 
 
+class WorkerFaissStartupTests(unittest.TestCase):
+    def setUp(self):
+        reset_faiss_indexes()
+
+    def tearDown(self):
+        reset_faiss_indexes()
+
+    def make_entry(self, entry_id, embedding):
+        return {
+            "entry_id": entry_id,
+            "prompt": f"prompt-{entry_id}",
+            "provider": "huggingface",
+            "model_id": "sentence-transformers/all-MiniLM-L6-v2",
+            "model_revision": "main",
+            "embedding_dimensions": len(embedding),
+            "embedding": embedding,
+            "response": {"answer": entry_id},
+            "created_at": "test",
+        }
+
+    @patch("worker.worker.get_semantic_cache_entries")
+    def test_worker_startup_rebuilds_faiss_from_semantic_cache_entries(self, mock_entries):
+        mock_client = Mock()
+        entries = [
+            self.make_entry("first", [1.0, 0.0]),
+            self.make_entry("second", [0.0, 1.0]),
+        ]
+        mock_entries.return_value = entries
+
+        with patch("worker.worker.VECTOR_SEARCH_ENGINE", "faiss"):
+            count = rebuild_worker_faiss_indexes(mock_client)
+
+        mock_entries.assert_called_once_with(mock_client)
+        self.assertEqual(count, 1)
+        self.assertEqual(get_faiss_index_size(), 2)
+
+        store = get_faiss_index(
+            entries=entries,
+            provider="huggingface",
+            model_id="sentence-transformers/all-MiniLM-L6-v2",
+            model_revision="main",
+            dimensions=2,
+        )
+        results = store.search_top_k([0.9, 0.1], k=1)
+
+        self.assertEqual(results[0]["entry"]["entry_id"], "first")
+
+
 class SemanticCacheTests(unittest.TestCase):
     def test_demo_delay_accepts_non_negative_number(self):
         with patch.dict("os.environ", {"DEMO_DELAY": "1.5"}):
@@ -82,7 +139,19 @@ class SemanticCacheTests(unittest.TestCase):
         for value in ("invalid", "-0.1", "1.1", "nan", "inf"):
             with self.subTest(value=value):
                 with self.assertRaises(ValueError):
-                    load_semantic_cache_threshold(value)
+                        load_semantic_cache_threshold(value)
+
+    def test_vector_search_engine_defaults_to_faiss(self):
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(load_vector_search_engine(), "faiss")
+
+    def test_vector_search_engine_accepts_supported_values_case_insensitively(self):
+        self.assertEqual(load_vector_search_engine("linear"), "linear")
+        self.assertEqual(load_vector_search_engine("FAISS"), "faiss")
+
+    def test_vector_search_engine_rejects_invalid_value(self):
+        with self.assertRaises(ValueError):
+            load_vector_search_engine("vector_store")
 
     def test_save_semantic_cache_entry_uses_valid_uuid_and_metadata(self):
         client = MemoryClient()
@@ -311,6 +380,8 @@ class SemanticCacheTests(unittest.TestCase):
             result = process_inference({"prompt": "new prompt", "provider": "fake"}, client)
 
         self.assertEqual(result["cache"], "hit")
+        self.assertNotIn("metrics:provider_call_count", client.data)
+        self.assertNotIn("metrics:provider_latency_ms_total", client.data)
         self.assertEqual(
             result["top_matches"],
             [{
@@ -394,6 +465,115 @@ class SemanticCacheTests(unittest.TestCase):
         self.assertEqual(result["cache"], "miss")
         self.assertEqual(store.index.ntotal, 1)
         self.assertEqual(matches[0]["entry"]["prompt"], "new prompt")
+        self.assertEqual(client.data["metrics:faiss_search_count"], "1")
+
+    def test_huggingface_search_uses_faiss_engine_when_configured(self):
+        client = MemoryClient()
+        faiss_store = Mock()
+        faiss_store.search_top_k.return_value = []
+
+        with (
+            patch("worker.worker.VECTOR_SEARCH_ENGINE", "faiss"),
+            patch("worker.worker.get_embedding", return_value=[1.0, 0.0]),
+            patch("worker.worker.generate_response", return_value={"answer": "fresh"}),
+            patch("worker.worker.get_faiss_index", return_value=faiss_store) as get_index,
+            patch("worker.worker.add_to_faiss") as add_entry,
+            patch("worker.worker.time.perf_counter", side_effect=[1.0, 1.125, 2.0, 2.25]),
+            patch("worker.worker.time.sleep"),
+            patch("builtins.print") as print_log,
+        ):
+            process_inference({"prompt": "new prompt", "provider": "huggingface"}, client)
+
+        get_index.assert_called_once()
+        faiss_store.search_top_k.assert_called_once_with(
+            embedding=[1.0, 0.0],
+            k=3,
+        )
+        add_entry.assert_called_once()
+        print_log.assert_any_call(
+            "Search engine=faiss provider=huggingface",
+            flush=True,
+        )
+        print_log.assert_any_call(
+            "FAISS search latency=125ms",
+            flush=True,
+        )
+        self.assertEqual(client.data["metrics:faiss_search_count"], "1")
+        self.assertEqual(client.data["metrics:faiss_search_latency_ms_total"], "125")
+        self.assertEqual(client.data["metrics:provider_call_count"], "1")
+        self.assertEqual(client.data["metrics:provider_latency_ms_total"], "250")
+
+    def test_huggingface_search_uses_linear_fallback_when_configured(self):
+        client = MemoryClient()
+
+        with (
+            patch("worker.worker.VECTOR_SEARCH_ENGINE", "linear"),
+            patch("worker.worker.get_embedding", return_value=[1.0, 0.0]),
+            patch("worker.worker.generate_response", return_value={"answer": "fresh"}),
+            patch("worker.worker.get_faiss_index") as get_index,
+            patch("worker.worker.add_to_faiss") as add_entry,
+            patch("worker.worker.time.perf_counter", side_effect=[1.0, 1.125, 2.0, 2.25]),
+            patch("worker.worker.time.sleep"),
+            patch("builtins.print") as print_log,
+        ):
+            result = process_inference(
+                {"prompt": "new prompt", "provider": "huggingface"},
+                client,
+            )
+
+        self.assertEqual(result["cache"], "miss")
+        get_index.assert_not_called()
+        add_entry.assert_not_called()
+        print_log.assert_any_call(
+            "Search engine=linear provider=huggingface",
+            flush=True,
+        )
+        print_log.assert_any_call(
+            "Linear search latency=125ms",
+            flush=True,
+        )
+        self.assertEqual(client.data["metrics:linear_search_count"], "1")
+        self.assertEqual(client.data["metrics:linear_search_latency_ms_total"], "125")
+        self.assertEqual(client.data["metrics:provider_call_count"], "1")
+        self.assertEqual(client.data["metrics:provider_latency_ms_total"], "250")
+
+    def test_fake_provider_logs_effective_linear_engine(self):
+        client = MemoryClient()
+
+        with (
+            patch("worker.worker.VECTOR_SEARCH_ENGINE", "faiss"),
+            patch("worker.worker.get_embedding", return_value=[1.0, 0.0]),
+            patch("worker.worker.generate_response", return_value={"answer": "fresh"}),
+            patch("worker.worker.time.perf_counter", side_effect=[1.0, 1.125, 2.0, 2.25]),
+            patch("worker.worker.time.sleep"),
+            patch("builtins.print") as print_log,
+        ):
+            process_inference({"prompt": "new prompt", "provider": "fake"}, client)
+
+        print_log.assert_any_call(
+            "Search engine=linear provider=fake",
+            flush=True,
+        )
+        print_log.assert_any_call(
+            "Linear search latency=125ms",
+            flush=True,
+        )
+        self.assertEqual(client.data["metrics:linear_search_count"], "1")
+        self.assertEqual(client.data["metrics:linear_search_latency_ms_total"], "125")
+        self.assertEqual(client.data["metrics:provider_call_count"], "1")
+        self.assertEqual(client.data["metrics:provider_latency_ms_total"], "250")
+
+    def test_linear_engine_skips_worker_startup_faiss_rebuild(self):
+        client = MemoryClient()
+
+        with (
+            patch("worker.worker.VECTOR_SEARCH_ENGINE", "linear"),
+            patch("worker.worker.rebuild_faiss_indexes") as rebuild_indexes,
+        ):
+            rebuilt = rebuild_worker_faiss_indexes(client)
+
+        self.assertEqual(rebuilt, 0)
+        rebuild_indexes.assert_not_called()
 
 
 if __name__ == "__main__":

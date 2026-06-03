@@ -126,6 +126,7 @@ class Server:
             b"FINISH": self.finish,
             b"ENQUEUE": self.enqueue,
             b"EXPIREAT": self.expireat,
+            b"INCRBY": self.incrby,
         }
     def incr(self, *args):
         self._require_args("INCR", args, 1)
@@ -149,6 +150,34 @@ class Server:
             self._append_to_aof([b"INCR", key])
 
             return value
+    def incrby(self, *args):
+        self._require_args("INCRBY", args, 2)
+        key = args[0]
+
+        try:
+            amount = int(args[1])
+        except (TypeError, ValueError):
+            raise CommandError("increment must be an integer")
+
+        with self._lock:
+            if self._is_expired(key):
+                current = None
+            else:
+                current = self._kv.get(key)
+
+            if current is None:
+                value = amount
+            else:
+                try:
+                    value = int(current) + amount
+                except (TypeError, ValueError):
+                    raise CommandError("value is not an integer")
+
+            self._kv[key] = str(value).encode("utf-8")
+            self._append_to_aof([b"INCRBY", key, str(amount).encode("utf-8")])
+
+            return value
+
     def get(self, *args):
         self._require_args("GET", args,1)
 
@@ -452,6 +481,28 @@ class Server:
 
             self._kv[job_key] = job_payload
             self._expiry.pop(job_key, None)
+
+            claim_key = self._claim_key(job_id)
+            claim_payload = self._kv.get(claim_key)
+
+            if claim_payload is not None:
+                try:
+                    claim = json.loads(claim_payload.decode("utf-8"))
+                    job = json.loads(job_payload.decode("utf-8"))
+                except (AttributeError, UnicodeDecodeError, json.JSONDecodeError):
+                    claim = None
+                    job = None
+
+                if isinstance(claim, dict) and isinstance(job, dict):
+                    claim["claimed_at"] = job.get("claimed_at", claim.get("claimed_at"))
+                    claim["lease_seconds"] = job.get(
+                        "lease_seconds",
+                        claim.get("lease_seconds"),
+                    )
+                    claim["worker_id"] = job.get("worker_id", claim.get("worker_id"))
+                    self._kv[claim_key] = json.dumps(claim).encode("utf-8")
+                    self._expiry.pop(claim_key, None)
+
             self._append_to_aof([b"UPDATECLAIM", job_id, job_key, job_payload, claim_token])
 
             return 1
@@ -573,7 +624,7 @@ class Server:
         claim_payload = self._kv.get(self._claim_key(job_id))
 
         if claim_payload is None:
-            return claim_token in (b"", "")
+            return False
 
         try:
             claim = json.loads(claim_payload.decode("utf-8"))

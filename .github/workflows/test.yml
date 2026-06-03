@@ -1,0 +1,40 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-api.txt
+          pip install -r requirements-redis.txt
+          pip install \
+            --index-url https://download.pytorch.org/whl/cpu \
+            torch==2.3.1
+          pip install -r requirements-worker.txt
+
+      - name: Compile Python files
+        run: |
+          python -m compileall -q redis_clone worker fastapi_cache ai providers tests benchmarks
+
+      - name: Run tests
+        run: |
+          python -m unittest discover -s tests -v
+
+      - name: Validate Docker Compose
+        run: |
+          docker compose config

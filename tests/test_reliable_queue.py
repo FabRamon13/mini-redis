@@ -144,6 +144,7 @@ class ReliableQueueTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             server = self.make_server(tmpdir)
             server.lpush(b"processing_jobs", b"job-1")
+            server.set(b"worker_claim:job-1", b'{"claim_token":""}')
 
             def requeue():
                 return server.requeue(
@@ -161,6 +162,51 @@ class ReliableQueueTests(unittest.TestCase):
             self.assertEqual(sum(results), 1)
             self.assertEqual(server.lrange(b"processing_jobs", b"0", b"-1"), [])
             self.assertEqual(server.lrange(b"jobs", b"0", b"-1"), [b"job-1"])
+
+    def test_token_protected_commands_reject_missing_claim_marker(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            server = self.make_server(tmpdir)
+            server.lpush(b"processing_jobs", b"job-1")
+
+            self.assertEqual(server.ack(b"processing_jobs", b"job-1", b""), 0)
+            self.assertEqual(
+                server.requeue(
+                    b"processing_jobs",
+                    b"jobs",
+                    b"job-1",
+                    b"job:job-1",
+                    b'{"status":"queued"}',
+                    b"",
+                ),
+                0,
+            )
+            self.assertEqual(
+                server.finish(
+                    b"processing_jobs",
+                    b"",
+                    b"job-1",
+                    b"job:job-1",
+                    b'{"status":"completed"}',
+                    b"",
+                ),
+                0,
+            )
+            self.assertEqual(
+                server.update_claim(
+                    b"job-1",
+                    b"job:job-1",
+                    b'{"status":"running"}',
+                    b"",
+                ),
+                0,
+            )
+
+            self.assertEqual(
+                server.lrange(b"processing_jobs", b"0", b"-1"),
+                [b"job-1"],
+            )
+            self.assertEqual(server.lrange(b"jobs", b"0", b"-1"), [])
+            self.assertIsNone(server.get(b"job:job-1"))
 
     def test_ack_removes_processing_job_and_claim_marker(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -289,14 +335,34 @@ class ReliableQueueTests(unittest.TestCase):
                 server.update_claim(
                     b"job-1",
                     b"job:job-1",
-                    b'{"status":"running"}',
+                    (
+                        b'{"status":"running",'
+                        b'"claimed_at":"2026-01-01T00:00:30+00:00",'
+                        b'"lease_seconds":60,'
+                        b'"worker_id":"worker-1"}'
+                    ),
                     b"claim-1",
                 ),
                 1,
             )
+            claim = json.loads(server.get(b"worker_claim:job-1"))
+            self.assertEqual(claim["claimed_at"], "2026-01-01T00:00:30+00:00")
+
+            self.assertEqual(
+                server.update_claim(
+                    b"job-1",
+                    b"job:job-1",
+                    b'{"status":"running","claimed_at":"2026-01-01T00:00:40+00:00"}',
+                    b"wrong-token",
+                ),
+                0,
+            )
+            claim = json.loads(server.get(b"worker_claim:job-1"))
+            self.assertEqual(claim["claimed_at"], "2026-01-01T00:00:30+00:00")
 
             reloaded = self.make_server(tmpdir)
-            self.assertEqual(reloaded.get(b"job:job-1"), b'{"status":"running"}')
+            reloaded_claim = json.loads(reloaded.get(b"worker_claim:job-1"))
+            self.assertEqual(reloaded_claim["claimed_at"], "2026-01-01T00:00:30+00:00")
 
     def test_finish_can_atomically_move_terminal_failure_to_dead_queue(self):
         with tempfile.TemporaryDirectory() as tmpdir:

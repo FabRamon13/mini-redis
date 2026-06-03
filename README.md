@@ -1,623 +1,557 @@
-# Mini Redis Clone
+# Mini Redis AI Infrastructure Platform
 
-A Redis-inspired TCP key-value store built in Python using sockets and a custom RESP-style protocol parser.
+## Overview
 
-This project was originally built to understand how backend systems and networked databases work internally, including:
+Mini Redis AI Infrastructure Platform is a backend systems and AI infrastructure project built from first principles.
 
-* TCP networking
-* Request parsing
-* Serialization
-* Persistence
-* Expiration logic
-* Concurrent clients
-* Containerized backend architecture
+The project began as a Redis-inspired TCP key-value store written in Python and evolved into a distributed inference platform featuring durable job processing, semantic caching, vector search, observability, and automated testing.
 
-The project later evolved into a distributed backend platform featuring:
+The system demonstrates concepts commonly found in backend, platform, and AI infrastructure engineering:
 
-* FastAPI cache-aside architecture
-* Distributed worker queues
+* Custom TCP networking
+* RESP protocol parsing
+* Durable persistence
+* Distributed job processing
+* Lease-based worker coordination
 * Semantic caching
+* Vector search
 * AI inference routing
-* Hugging Face model integration
-* Observability and benchmarking
+* Observability and metrics
+* CI/CD validation
 
 ---
 
-## Features
+# Architecture
 
-### Core Redis Features
+```text
+                 Client
+                    │
+                    ▼
+              FastAPI API
+                    │
+                    ▼
+          Redis Clone Datastore
+      ┌─────────────┼─────────────┐
+      │             │             │
+      ▼             ▼             ▼
+ Key/Value      Job Queue      Metrics
+   Store          State         Store
+                    │
+                    ▼
+                 Workers
+                    │
+                    ▼
+             Provider Router
+            ┌──────────────┐
+            │              │
+            ▼              ▼
+      Fake Provider   Hugging Face
+            │              │
+            └──────┬───────┘
+                   ▼
+             Semantic Cache
+                   │
+                   ▼
+              FAISS Index
+```
+
+---
+
+# Core Features
+
+## Redis Clone
 
 * TCP client/server architecture
-* RESP-style protocol parser and serializer
+* RESP-style protocol parser
 * Command dispatch layer
-* In-memory key-value storage
-* PING / GET / SET / DELETE / FLUSH
-* MGET / MSET
-* EXISTS / TTL
-* TTL expiration with lazy cleanup
-* Append-only file (AOF) persistence
-* Concurrent client handling with gevent
-* Thread-safe shared state using locks
+* Thread-safe shared state
+* Concurrent client handling
+* Key-value storage
+* TTL expiration
+* AOF persistence
+* Startup replay
+* Atomic counters
 
-### FastAPI Cache Integration
-
-* FastAPI cache-aside architecture
-* Dockerized multi-service deployment
-* Cache hit/miss tracking
-* Cache invalidation endpoints
-* Request timing metrics
-* Simulated database latency
-
-### Distributed Worker Queue
-
-* Asynchronous job processing
-* Worker pool architecture
-* Retry handling
-* Dead-letter queue support
-* Job status tracking
-* Queue metrics
-* Worker identification
-* Scalable background processing
-
-### AI Infrastructure Layer
-
-* Inference job routing
-* Provider abstraction layer
-* Semantic cache
-* Embedding generation
-* Cosine similarity search
-* Hugging Face integration
-* Provider-safe caching
-* AI workload benchmarking
-
----
-
-## System Architecture
+### Supported Commands
 
 ```text
-Client
-↓
-FastAPI API
-↓
-Redis Clone
-├── Key-Value Store
-├── Persistence Layer
-├── Job Queue
-└── Metrics Store
-↓
-Worker Pool
-↓
-Provider Router
-├── Fake Provider
-└── Hugging Face Provider
-↓
-Semantic Cache
-↓
-Inference Results
+GET
+SET
+DELETE
+FLUSH
+
+MGET
+MSET
+
+EXISTS
+TTL
+
+LPUSH
+RPOP
+LLEN
+LRANGE
+LREM
+
+INCR
+INCRBY
+
+ENQUEUE
+CLAIM
+UPDATECLAIM
+REQUEUE
+ACK
+FINISH
 ```
 
 ---
 
-## Request Lifecycle
+# Persistence
 
-### Redis Operations
-
-1. Client serializes commands into RESP-style byte streams
-2. TCP socket sends bytes to the server
-3. Server parses bytes into Python objects
-4. Command dispatcher executes the appropriate method
-5. Server serializes the response
-6. Client parses the response back into Python values
-
-### Inference Operations
-
-1. Client submits an inference request
-2. FastAPI creates a job
-3. Job is pushed into the Redis queue
-4. Worker pulls the job
-5. Semantic cache is checked
-6. Cache hit returns immediately
-7. Cache miss routes to a model provider
-8. Response is stored and returned
-
----
-
-## Example Commands
-
-```python
-client.set("name", "Ramon")
-client.get("name")
-
-client.set("temp", "123", "EX", "10")
-client.ttl("temp")
-
-client.mset("k1", "v1", "k2", "v2")
-client.mget("k1", "k2")
-```
-
----
-
-## TTL Expiration
-
-TTL support was implemented using lazy expiration.
-
-Expiration timestamps are stored separately from values.
-
-### Internal Storage
-
-```python
-_kv
-_expiry
-```
-
-* `_kv` stores key/value pairs
-* `_expiry` stores expiration timestamps
-
-Expired keys are removed when accessed.
-
----
-
-## Persistence
-
-The server uses an append-only file (AOF) persistence model.
-
-Write operations are serialized using the RESP protocol and replayed on server startup to rebuild in-memory state.
-
-This introduces concepts similar to:
-
-* Write-ahead logging
-* Event sourcing
-* Redis AOF persistence
-
----
-
-## Dockerized Deployment
-
-Run the full system:
-
-```bash
-docker compose up --build
-```
-
-### Services
-
-* FastAPI API
-* Redis Clone
-* Worker Pool
-
-FastAPI runs on:
+All mutating commands are written to an append-only file.
 
 ```text
-http://127.0.0.1:8000
+SET
+MSET
+DELETE
+LPUSH
+CLAIM
+FINISH
+INCR
+INCRBY
+...
 ```
+
+During startup:
+
+```text
+Server Starts
+      ↓
+Read AOF
+      ↓
+Replay Commands
+      ↓
+Rebuild State
+```
+
+Redis Clone remains the durable source of truth for:
+
+* queue state
+* semantic cache entries
+* metrics
+* job metadata
 
 ---
 
-## Distributed Worker Queue
+# Distributed Worker Queue
 
-The project includes a queue-backed asynchronous processing system inspired by production task queues such as:
+The project includes a durable queue architecture inspired by systems such as:
 
 * Celery
 * Sidekiq
 * BullMQ
 
-### Queue Architecture
-
-```text
-FastAPI API
-↓
-LPUSH job_id
-↓
-Redis Clone Queue
-↓
-RPOP by Worker Pool
-↓
-Job Status Store
-```
-
-### Job Lifecycle
+## Queue Lifecycle
 
 ```text
 Queued
-↓
-Running
-↓
-Completed
+  │
+  ▼
+Claimed
+  │
+  ▼
+Processing
+  │
+  ├────► Requeue
+  │
+  ├────► Complete
+  │
+  └────► Dead Letter
 ```
 
-Failure path:
+## Reliability Features
+
+### Claim Tokens
+
+Every claimed job receives a unique claim token.
 
 ```text
-Queued
-↓
-Running
-↓
-Retry
-↓
-Retry
-↓
-Failed
-↓
-Dead Letter Queue
+Job
+ ↓
+Claim
+ ↓
+Claim Token
 ```
 
-### Job Metadata
+Only the owning worker can:
 
-Each job tracks:
+* ACK
+* REQUEUE
+* FINISH
+* UPDATECLAIM
 
-* Status
-* Attempts
-* Max attempts
-* Created time
-* Start time
-* Completion time
-* Failure time
-* Worker ID
-* Result
-* Error message
+### Worker Leases
+
+Workers claim jobs using time-based leases.
+
+```text
+Claim
+ ↓
+Lease
+ ↓
+Heartbeat
+ ↓
+Lease Extension
+```
+
+### Recovery
+
+Stale claims are automatically recovered.
+
+```text
+Worker Crash
+ ↓
+Lease Expiration
+ ↓
+Recovery Scan
+ ↓
+Requeue
+```
+
+This provides at-least-once delivery semantics.
 
 ---
 
-## AI Infrastructure Layer
+# AI Infrastructure Layer
 
-The project evolved beyond a Redis clone into a lightweight AI serving platform.
-
-Inference requests are submitted through FastAPI and executed asynchronously by workers.
-
-### Inference Architecture
+Inference requests are processed asynchronously by workers.
 
 ```text
-Client
-↓
 POST /inference
-↓
-Job Queue
-↓
-Worker Pool
-↓
+       ↓
+Queue
+       ↓
+Worker
+       ↓
 Provider Router
-↓
+       ↓
 Model Provider
-↓
-Result Storage
+       ↓
+Response
 ```
 
-### Supported Providers
+Supported providers:
 
 * Fake Provider
 * Hugging Face Provider
 
-Provider routing allows new model providers to be added without modifying worker logic.
-
-```text
-generate_response()
-├── fake
-└── huggingface
-```
+Provider routing allows new providers to be added without modifying worker execution logic.
 
 ---
 
-## Semantic Cache
+# Semantic Cache
 
-A semantic cache layer reduces repeated inference cost by matching requests based on embedding similarity rather than exact string equality.
+The semantic cache reduces repeated inference costs.
 
-### Flow
+Instead of matching exact strings:
+
+```text
+Prompt A == Prompt B
+```
+
+the cache compares vector similarity:
+
+```text
+Embedding A
+      vs
+Embedding B
+```
+
+## Semantic Cache Flow
 
 ```text
 Prompt
-↓
+   ↓
 Embedding Generation
-↓
-Cosine Similarity Search
-↓
-Cache Hit / Cache Miss
+   ↓
+Vector Search
+   ↓
+Similarity Threshold
+   ↓
+Hit / Miss
 ```
-
-### Cache Storage
 
 Each cache entry stores:
 
-* Prompt
-* Provider
-* Embedding
-* Response
+* prompt
+* provider
+* model_id
+* model_revision
+* embedding_dimensions
+* embedding
+* response
 
-### Provider-Safe Caching
+Provider and model isolation prevent cross-model cache contamination.
 
-Cache entries are isolated by provider.
+---
 
-Example:
+# FAISS Vector Search
+
+The project supports two search engines:
+
+## Linear Search
 
 ```text
-provider=fake
+O(n)
 ```
 
-does not satisfy:
+Every cached embedding is scanned.
+
+## FAISS Search
 
 ```text
-provider=huggingface
+Approximate Nearest Neighbor Search
 ```
 
-even when prompts are identical.
+Substantially faster retrieval at larger scales.
 
-### Metrics
+### Signature Isolation
+
+Separate FAISS indexes are maintained for:
+
+```text
+provider
+model_id
+model_revision
+embedding_dimensions
+```
+
+This prevents incompatible embeddings from sharing indexes.
+
+### Rebuild Strategy
+
+Redis remains the source of truth.
+
+FAISS is treated as an acceleration layer.
+
+```text
+Worker Startup
+      ↓
+Load Semantic Cache Entries
+      ↓
+Validate Signatures
+      ↓
+Rebuild FAISS Indexes
+```
+
+If FAISS indexes are lost, workers automatically rebuild them.
+
+---
+
+# Metrics & Observability
+
+The platform exposes both JSON and Prometheus-style metrics.
+
+## JSON Metrics
+
+```http
+GET /jobs/metrics
+```
+
+## Prometheus Metrics
+
+```http
+GET /metrics
+```
 
 Tracked metrics include:
 
-* Semantic cache hits
-* Semantic cache misses
-* Semantic cache hit rate
-
-Example:
-
 ```text
-Hits: 9
-Misses: 1
-Hit Rate: 90%
+processed_jobs
+failed_jobs
+
+queued_jobs
+processing_jobs
+dead_jobs
+
+semantic_cache_hits
+semantic_cache_misses
+semantic_cache_hit_rate
+
+faiss_search_count
+faiss_search_latency_ms_avg
+
+linear_search_count
+linear_search_latency_ms_avg
+
+provider_call_count
+provider_latency_ms_avg
 ```
 
 ---
 
-## Hugging Face Integration
+# FastAPI API
 
-The worker supports real model execution through a provider abstraction layer.
-
-### Current Model
-
-```text
-sentence-transformers/all-MiniLM-L6-v2
-```
-
-### Model Characteristics
-
-* CPU-only deployment
-* 384-dimensional embeddings
-* Lazy-loaded model initialization
-* Provider-based execution
-
-The model is loaded only when required:
-
-```text
-Worker
-↓
-Hugging Face Provider
-↓
-Model Load
-↓
-Embedding Generation
-```
-
----
-
-## Observability & Infrastructure
-
-The FastAPI layer includes operational tooling commonly found in production backend services.
-
-### Health Checks
-
-Endpoint:
+## Health
 
 ```http
 GET /health
 ```
 
-Returns:
+## Inference
 
-* API status
-* Redis connectivity
-
-### Request Tracing
-
-Every request receives a unique request ID.
-
-Headers:
-
-```text
-X-Request-ID
+```http
+POST /inference
 ```
 
-Logged metadata:
+## Job Status
 
-* Request ID
-* Endpoint
-* Status code
-* Latency
-* Client IP
+```http
+GET /jobs/{job_id}
+```
 
-### Configuration Management
+## Metrics
 
-Typed settings loaded from environment variables.
+```http
+GET /jobs/metrics
+GET /metrics
+```
 
-Examples:
+## Cache Invalidation
 
-* redis_host
-* redis_port
-* cache_ttl
-* max_queue_size
+```http
+DELETE /cache/users/{user_id}
+```
 
 ---
 
-## Benchmarking
+# Configuration
 
-The project includes benchmarking utilities for measuring cache effectiveness and inference latency.
-
-### Semantic Cache Benchmark
-
-Example results:
+Environment-driven configuration controls:
 
 ```text
-Requests: 10
-Hits: 9
-Misses: 1
+REDIS_HOST
+REDIS_PORT
 
-Hit Rate: 90%
+SEMANTIC_CACHE_THRESHOLD
 
-p50 Latency: 66.71 ms
-p95 Latency: 67.79 ms
-Average Latency: 355.56 ms
+VECTOR_SEARCH_ENGINE
+
+WORKER_LEASE_SECONDS
+
+WORKER_RECOVERY_INTERVAL_SECONDS
+
+SEMANTIC_CACHE_MAX_ENTRIES
 ```
-
-### Latency Comparison
-
-Cache miss:
-
-```text
-~3500 ms
-```
-
-Cache hit:
-
-```text
-~5–70 ms
-```
-
-This demonstrates the effectiveness of semantic caching for repeated inference requests.
 
 ---
 
-## Tests
+# Testing
 
-Integration tests cover:
+The project includes:
 
-* SET / GET
-* Overwrite behavior
-* Missing keys
-* MSET / MGET
-* TTL expiration
-* AOF persistence
-* Concurrent clients
-* Queue operations
-* Job lifecycle management
-* Semantic cache functionality
+* unit tests
+* integration tests
+* persistence tests
+* queue tests
+* semantic cache tests
+* FAISS rebuild tests
+* API tests
 
----
-
-## Docker Persistence
-
-Append-only file persistence is stored inside a Docker volume.
+Current status:
 
 ```text
-redis_data:/app/data
+162 tests passing
+5 skipped
 ```
 
-This allows persistence data to survive:
+Validation pipeline:
 
-* Container restarts
-* Container recreation
-* Worker restarts
+```bash
+python -m unittest discover -s tests -v
+python -m compileall -q redis_clone worker fastapi_cache ai providers tests benchmarks
+docker compose config
+```
 
 ---
 
-## Graceful Shutdown
+# CI/CD
 
-The FastAPI application manages cache lifecycle using lifespan events.
+GitHub Actions validates:
 
-### Startup
+* dependency installation
+* compile checks
+* automated tests
+* Docker Compose configuration
+
+Every push and pull request runs the validation pipeline automatically.
+
+---
+
+# Running Locally
+
+```bash
+docker compose up --build
+```
+
+API:
 
 ```text
-Create shared cache connection
+http://localhost:8000
 ```
 
-### Shutdown
+Health Check:
 
-```text
-Close socket connection cleanly
+```bash
+curl http://localhost:8000/health
 ```
-
-This prevents resource leaks and prepares the system for future distributed deployments.
 
 ---
 
-## Current Limitations
+# Current Limitations
 
-* No active background expiration sweeps
-* No AOF compaction/rewrite
-* No replication or clustering
-* No snapshotting
-* TTL replay after restart resets expiration duration
-* Limited RESP compatibility compared to real Redis
-* No distributed scheduling
-* No vector database backend
-* Semantic cache uses linear similarity search
-* No model observability dashboard
-* No Kubernetes deployment
-* No multi-node worker orchestration
+* Educational Redis implementation, not production Redis
+* No authentication or TLS
+* No AOF rewrite/compaction
+* No replication
+* No clustering
+* No snapshot persistence
+* At-least-once delivery semantics
+* Semantic cache insertion is not fully atomic
+* FAISS indexes are worker-local
+* Docker Compose configuration is development-oriented
 
 ---
 
-## Future Improvements
+# Technology Stack
 
-### Backend Infrastructure
+Backend:
 
-* Redis replication
-* Snapshot persistence
-* AOF rewrite support
-* Background expiration sweeps
-* Cluster support
+* Python
+* FastAPI
+* gevent
 
-### AI Infrastructure
+AI:
 
-* OpenAI provider
-* Additional Hugging Face providers
-* Vector database integration
-* RAG pipelines
-* Model observability
-* Request batching
-* Streaming responses
+* Hugging Face Transformers
+* Sentence Transformers
+* FAISS
 
-### Cloud Infrastructure
+Infrastructure:
 
-* AWS deployment
-* Kubernetes orchestration
-* Terraform infrastructure
-* CI/CD pipelines
-* Distributed worker scaling
-* Monitoring dashboards
+* Docker
+* Docker Compose
+* GitHub Actions
 
----
+Storage:
 
-## FAISS Boundary
+* Custom Redis-inspired datastore
+* Append-only persistence
 
-Redis Clone remains the source of truth.
+Testing:
 
-Redis stores:
-
-- prompt
-- provider
-- model_id
-- model_revision
-- embedding_dimensions
-- embedding
-- response
-- semantic cache metadata
-- job state
-- queue state
-
-FAISS stores:
-
-- vectors for nearest-neighbor search
-- integer index IDs mapped to semantic cache entries
-
-FAISS does not own durable state.
-
-If the FAISS index is lost, corrupted, or restarted, it should be rebuilt from Redis semantic cache entries.
-
-### Rebuild Flow
-
-```text
-Worker starts
-↓
-Read semantic_cache:index from Redis Clone
-↓
-Load semantic_cache:<uuid> entries
-↓
-Validate provider/model/dimensions
-↓
-Insert embeddings into FAISS
-↓
-Build faiss_id → entry_id mapping
+* unittest
+* integration testing
+* benchmark tooling
 
 ```
 ```
-
-
