@@ -484,3 +484,126 @@ Current suite:
 5. Metrics use atomic counters.
 6. Semantic cache is provider/model isolated.
 7. Recovery is automatic after worker failure.
+
+# AWS Deployment Architecture
+
+The deployed version runs on a single AWS EC2 instance.
+
+```text
+Developer Machine
+      │
+      │ SSH
+      ▼
+AWS EC2 Instance
+      │
+      ├── Docker Compose
+      │
+      ├── FastAPI Container
+      │
+      ├── Redis Clone Container
+      │
+      └── Worker Container
+```
+
+## EC2 Runtime
+
+The EC2 instance runs:
+
+```text
+Ubuntu Server 24.04 LTS
+Docker
+Docker Compose
+```
+
+The application is deployed using:
+
+```bash
+docker-compose -f docker-compose.prod.yml up -d
+```
+
+## Network Boundary
+
+Only the FastAPI service is exposed externally.
+
+```text
+Internet / Developer IP
+          │
+          ▼
+EC2 Security Group
+          │
+          ▼
+Port 8000
+          │
+          ▼
+FastAPI Container
+```
+
+Redis Clone is not exposed publicly.
+
+```text
+Redis Clone Port 31337
+Internal Docker network only
+```
+
+This keeps the datastore accessible to the API and worker containers while preventing direct external access.
+
+## Container Boundary
+
+```text
+FastAPI Container
+  - HTTP API
+  - Job creation
+  - Metrics endpoints
+
+Redis Clone Container
+  - TCP datastore
+  - Queue state
+  - AOF persistence
+  - Metrics counters
+
+Worker Container
+  - Job processing
+  - Hugging Face embeddings
+  - FAISS indexes
+  - Semantic cache updates
+```
+
+The worker owns the heavy ML dependencies. The API and Redis containers remain lightweight.
+
+## Deployment Flow
+
+Manual deployment flow:
+
+```text
+SSH into EC2
+      ↓
+git pull origin main
+      ↓
+docker-compose -f docker-compose.prod.yml down
+      ↓
+docker-compose -f docker-compose.prod.yml build
+      ↓
+docker-compose -f docker-compose.prod.yml up -d
+      ↓
+curl /health
+```
+
+Planned GitHub Actions deployment flow:
+
+```text
+Run Deploy workflow
+      ↓
+GitHub Actions connects to EC2 over SSH
+      ↓
+Pulls latest main branch
+      ↓
+Rebuilds Docker images
+      ↓
+Restarts containers
+      ↓
+Runs health check
+```
+
+The deploy workflow is manual-only for now because the EC2 instance is stopped when not in use to avoid unnecessary AWS charges.
+
+

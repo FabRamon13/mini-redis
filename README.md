@@ -487,6 +487,102 @@ Every push and pull request runs the validation pipeline automatically.
 
 ---
 
+## AWS Deployment
+
+The platform has been deployed on AWS EC2 using Docker Compose.
+
+Deployment stack:
+
+```text
+AWS EC2
+Ubuntu Server 24.04 LTS
+Docker
+Docker Compose
+FastAPI API
+Redis Clone
+Worker Service
+```
+
+Production-style Compose file:
+
+```text
+docker-compose.prod.yml
+```
+
+The production Compose setup differs from local development:
+
+* No source-code bind mounts
+* No FastAPI `--reload`
+* Redis port is not exposed publicly
+* Only the API port is exposed
+* Services restart automatically unless stopped
+
+Public API access is provided through the EC2 instance on port `8000`.
+
+Health check:
+
+```bash
+curl http://<EC2_PUBLIC_IP>:8000/health
+```
+
+Example successful response:
+
+```json
+{
+  "status": "healthy",
+  "api": "healthy",
+  "cache": "healthy"
+}
+```
+
+### Deployment Verification
+
+The deployed system was tested end-to-end:
+
+```text
+POST /inference
+      ↓
+FastAPI enqueues job
+      ↓
+Worker claims job
+      ↓
+Hugging Face embedding generated
+      ↓
+FAISS semantic search executes
+      ↓
+Semantic cache miss stores entry
+      ↓
+Similar request returns cache hit
+      ↓
+Metrics update
+```
+
+Example semantic cache behavior:
+
+```text
+Prompt 1: "what is a cache"
+Result: cache miss
+
+Prompt 2: "explain a cache"
+Result: cache hit
+Matched prompt: "what is a cache"
+Similarity score: 0.8859
+```
+
+Metrics confirmed:
+
+```text
+semantic_cache_hits: 1
+semantic_cache_misses: 1
+semantic_cache_hit_rate: 0.5
+faiss_search_count: 2
+provider_call_count: 1
+```
+
+This proves the deployed system can process asynchronous inference jobs, use FAISS-backed semantic caching, and expose runtime observability metrics from AWS.
+
+---
+
 # Running Locally
 
 ```bash
@@ -510,15 +606,21 @@ curl http://localhost:8000/health
 # Current Limitations
 
 * Educational Redis implementation, not production Redis
-* No authentication or TLS
+* No authentication, authorization, or TLS
 * No AOF rewrite/compaction
-* No replication
-* No clustering
+* No replication or high availability
+* No clustering or sharding
 * No snapshot persistence
-* At-least-once delivery semantics
+* Queue provides at-least-once delivery semantics
 * Semantic cache insertion is not fully atomic
-* FAISS indexes are worker-local
-* Docker Compose configuration is development-oriented
+* FAISS indexes are worker-local and rebuilt on startup
+* Single-worker deployment has not been validated at scale
+* Metrics are stored in Redis and are not exported to Prometheus
+* No automated deployment rollback mechanism
+* AWS deployment currently runs on a single EC2 instance
+* Deployments require rebuilding Docker images on the target server
+* No load balancing or multi-instance deployment
+
 
 ---
 
