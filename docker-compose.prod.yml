@@ -1,0 +1,48 @@
+services:
+  redis_clone:
+    build:
+      context: .
+      dockerfile: Dockerfile.redis
+    environment:
+      REDIS_BIND_HOST: 0.0.0.0
+      REDIS_PORT: 31337
+      AOF_FILE: /app/data/appendonly.aof
+    volumes:
+      - redis_data:/app/data
+    command: ["python", "-m", "redis_clone.server"]
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    ports:
+      - "8000:8000"
+    depends_on:
+      - redis_clone
+    environment:
+      REDIS_HOST: redis_clone
+      REDIS_PORT: 31337
+    command: ["uvicorn", "fastapi_cache.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    depends_on:
+      - redis_clone
+    environment:
+      REDIS_HOST: redis_clone
+      REDIS_PORT: 31337
+      SEMANTIC_CACHE_THRESHOLD: "0.75"
+      SEMANTIC_CACHE_MAX_ENTRIES: "1000"
+      WORKER_LEASE_SECONDS: "60"
+      WORKER_RECOVERY_INTERVAL_SECONDS: "30"
+      WORKER_HEARTBEAT_INTERVAL_SECONDS: "15"
+      VECTOR_SEARCH_ENGINE: "faiss"
+    command: ["python", "-m", "worker.worker"]
+    restart: unless-stopped
+
+volumes:
+  redis_data:
