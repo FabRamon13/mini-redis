@@ -38,6 +38,65 @@ This document describes the internal architecture of the Mini Redis AI Infrastru
 
 ---
 
+# End-to-End Request Flow
+
+The following diagram shows the complete lifecycle of an inference request.
+
+```text
+Client
+  │
+POST /inference
+  │
+  ▼
+FastAPI
+  │
+ENQUEUE
+  │
+  ▼
+Redis Clone
+  │
+CLAIM
+  │
+  ▼
+Worker
+  │
+Embedding Generation
+  │
+  ▼
+FAISS Search
+  │
+Hit / Miss
+  │
+  ├────► Cache Hit
+  │           │
+  │           ▼
+  │      Cached Response
+  │
+  └────► Cache Miss
+              │
+              ▼
+      Provider Router
+              │
+              ▼
+      Hugging Face Provider
+              │
+              ▼
+      Semantic Cache Update
+              │
+              ▼
+            FINISH
+              │
+              ▼
+         Redis Clone
+              │
+              ▼
+      Client Polls Result
+```
+
+This flow demonstrates the interaction between the API layer, queueing system, worker infrastructure, semantic cache, vector search layer, and persistence layer.
+
+---
+
 # Service Responsibilities
 
 ## FastAPI
@@ -485,6 +544,26 @@ Current suite:
 6. Semantic cache is provider/model isolated.
 7. Recovery is automatic after worker failure.
 
+---
+
+# Architectural Tradeoffs
+
+The platform intentionally favors simplicity and observability over maximum scalability.
+
+Current tradeoffs include:
+
+* Redis Clone remains the source of truth for all application state.
+* FAISS indexes are treated as rebuildable acceleration structures.
+* Queue delivery semantics are at-least-once rather than exactly-once.
+* Metrics are stored directly in Redis Clone using atomic counters.
+* Workers are designed to be disposable and recoverable.
+* Deployments currently target a single EC2 instance.
+* Semantic cache isolation prioritizes correctness over index sharing.
+
+These decisions reduce system complexity while preserving durability, recoverability, and debuggability.
+
+---
+
 # AWS Deployment Architecture
 
 The deployed version runs on a single AWS EC2 instance.
@@ -588,7 +667,7 @@ docker-compose -f docker-compose.prod.yml up -d
 curl /health
 ```
 
-Planned GitHub Actions deployment flow:
+GitHub Actions deployment flow:
 
 ```text
 Run Deploy workflow

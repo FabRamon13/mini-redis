@@ -4,7 +4,7 @@
 
 Mini Redis AI Infrastructure Platform is a backend systems and AI infrastructure project built from first principles.
 
-The project began as a Redis-inspired TCP key-value store written in Python and evolved into a distributed inference platform featuring durable job processing, semantic caching, vector search, observability, and automated testing.
+The project began as a Redis-inspired TCP key-value store written in Python and evolved into a distributed AI inference and semantic caching platform featuring durable job processing, lease-based worker coordination, semantic caching, vector search, observability, cloud deployment, and automated testing.
 
 The system demonstrates concepts commonly found in backend, platform, and AI infrastructure engineering:
 
@@ -17,7 +17,9 @@ The system demonstrates concepts commonly found in backend, platform, and AI inf
 * Vector search
 * AI inference routing
 * Observability and metrics
-* CI/CD validation
+* Continuous Integration
+* Deployment workflows
+
 
 ---
 
@@ -447,22 +449,18 @@ SEMANTIC_CACHE_MAX_ENTRIES
 
 # Testing
 
-The project includes:
+The project includes a comprehensive automated test suite covering:
 
-* unit tests
-* integration tests
-* persistence tests
-* queue tests
-* semantic cache tests
-* FAISS rebuild tests
-* API tests
-
-Current status:
-
-```text
-162 tests passing
-5 skipped
-```
+* protocol parsing
+* persistence and AOF replay
+* TTL expiration
+* queue operations
+* lease recovery
+* semantic cache behavior
+* FAISS indexing and rebuilds
+* metrics collection
+* API endpoints
+* worker execution flows
 
 Validation pipeline:
 
@@ -471,6 +469,7 @@ python -m unittest discover -s tests -v
 python -m compileall -q redis_clone worker fastapi_cache ai providers tests benchmarks
 docker compose config
 ```
+
 
 ---
 
