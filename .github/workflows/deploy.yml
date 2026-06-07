@@ -14,11 +14,47 @@ jobs:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
+          command_timeout: 20m
           script: |
+            set -e
+
             cd ~/mini-redis
-            git pull origin main
-            docker-compose -f docker-compose.prod.yml down
-            docker-compose -f docker-compose.prod.yml build
-            docker-compose -f docker-compose.prod.yml up -d
-            docker ps
-            curl -f http://localhost:8000/health
+            git pull --ff-only origin main
+
+            if docker compose version >/dev/null 2>&1; then
+              compose() { docker compose "$@"; }
+            else
+              compose() { docker-compose "$@"; }
+            fi
+
+            compose -f docker-compose.prod.yml down
+            compose -f docker-compose.prod.yml build
+            compose -f docker-compose.prod.yml up -d
+            compose -f docker-compose.prod.yml ps
+
+            for attempt in $(seq 1 20); do
+              health_response=$(
+                curl --fail --silent --show-error \
+                  http://localhost:8000/health ||
+                  true
+              )
+
+              if printf '%s' "$health_response" |
+                grep -q '"status":"healthy"'; then
+                printf '%s\n' "$health_response"
+                echo
+                echo "Deployment health check passed"
+                exit 0
+              fi
+
+              echo "Waiting for API health check ($attempt/20)"
+              sleep 5
+            done
+
+            echo "Deployment health check failed"
+            compose -f docker-compose.prod.yml ps
+            compose -f docker-compose.prod.yml logs \
+              --no-color \
+              --tail=200 \
+              redis_clone api worker
+            exit 1
