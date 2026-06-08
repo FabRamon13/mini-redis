@@ -44,5 +44,17 @@ services:
     command: ["python", "-m", "worker.worker"]
     restart: unless-stopped
 
+  prometheus:
+    image: prom/prometheus:v2.55.0
+    depends_on:
+      - api
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    restart: unless-stopped
+
 volumes:
   redis_data:
+  prometheus_data:

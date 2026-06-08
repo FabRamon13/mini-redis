@@ -38,3 +38,4 @@ jobs:
       - name: Validate Docker Compose
         run: |
           docker compose config
+          docker compose -f docker-compose.prod.yml config

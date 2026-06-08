@@ -46,5 +46,16 @@ services:
       - .:/app
     command: ["python", "-m", "worker.worker"]
 
+  prometheus:
+    image: prom/prometheus:v2.55.0
+    depends_on:
+      - api
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+
 volumes:
   redis_data:
+  prometheus_data:

@@ -610,6 +610,12 @@ Health Check:
 curl http://localhost:8000/health
 ```
 
+Prometheus:
+
+```text
+http://localhost:9090
+```
+
 ---
 
 # Current Limitations
@@ -624,7 +630,7 @@ curl http://localhost:8000/health
 * Semantic cache insertion is not fully atomic
 * FAISS indexes are worker-local and rebuilt on startup
 * Single-worker deployment has not been validated at scale
-* Metrics are stored in Redis and are not exported to Prometheus
+* Prometheus scraping is bundled, but alerting and external dashboards are not configured
 * No automated deployment rollback mechanism
 * AWS deployment currently runs on a single EC2 instance
 * Deployments require rebuilding Docker images on the target server
