@@ -1,11 +1,14 @@
 import json
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from fastapi import HTTPException
 
 from fastapi_cache.main import enqueue_job
+from fastapi_cache.main import create_inference_request
 from fastapi_cache.main import get_job_metrics
+from fastapi_cache.main import InferenceRequest
 from fastapi_cache.main import prometheus_metrics
 from redis_clone.exceptions import CommandError
 
@@ -69,6 +72,27 @@ class CorruptMetricsCache(MetricsCache):
 
 
 class ApiEnqueueTests(unittest.TestCase):
+    def test_inference_job_persists_request_id_for_worker_correlation(self):
+        cache = RecordingCache()
+        request = SimpleNamespace(
+            app=SimpleNamespace(state=SimpleNamespace(cache=cache)),
+            state=SimpleNamespace(request_id="request-1"),
+        )
+
+        with patch("fastapi_cache.main.log_event") as log_event:
+            response = create_inference_request(
+                InferenceRequest(prompt="what is redis", provider="fake"),
+                request,
+            )
+
+        payload = json.loads(cache.calls[0][3])
+
+        self.assertEqual(payload["request_id"], "request-1")
+        self.assertEqual(payload["id"], response["job_id"])
+        log_event.assert_called_once()
+        self.assertEqual(log_event.call_args.args[1], "job_enqueued")
+        self.assertEqual(log_event.call_args.kwargs["request_id"], "request-1")
+
     def test_enqueue_job_uses_atomic_cache_command(self):
         cache = RecordingCache()
         job_data = {"id": "job-1", "status": "queued"}

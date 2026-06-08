@@ -1,7 +1,7 @@
 import json
 import unittest
 import uuid
-from unittest.mock import Mock
+from unittest.mock import ANY, Mock
 from unittest.mock import patch
 
 from worker.worker import load_non_negative_float
@@ -480,7 +480,7 @@ class SemanticCacheTests(unittest.TestCase):
             patch("worker.worker.add_to_faiss") as add_entry,
             patch("worker.worker.time.perf_counter", side_effect=[1.0, 1.125, 2.0, 2.25]),
             patch("worker.worker.time.sleep"),
-            patch("builtins.print") as print_log,
+            patch("worker.worker.log_event") as log_event,
         ):
             process_inference({"prompt": "new prompt", "provider": "huggingface"}, client)
 
@@ -490,13 +490,25 @@ class SemanticCacheTests(unittest.TestCase):
             k=3,
         )
         add_entry.assert_called_once()
-        print_log.assert_any_call(
-            "Search engine=faiss provider=huggingface",
-            flush=True,
+        log_event.assert_any_call(
+            ANY,
+            "vector_search_started",
+            request_id=None,
+            job_id=None,
+            provider="huggingface",
+            search_engine="faiss",
+            candidate_count=0,
         )
-        print_log.assert_any_call(
-            "FAISS search latency=125ms",
-            flush=True,
+        log_event.assert_any_call(
+            ANY,
+            "vector_search_completed",
+            request_id=None,
+            job_id=None,
+            provider="huggingface",
+            search_engine="faiss",
+            candidate_count=0,
+            result_count=0,
+            duration_ms=125,
         )
         self.assertEqual(client.data["metrics:faiss_search_count"], "1")
         self.assertEqual(client.data["metrics:faiss_search_latency_ms_total"], "125")
@@ -514,7 +526,7 @@ class SemanticCacheTests(unittest.TestCase):
             patch("worker.worker.add_to_faiss") as add_entry,
             patch("worker.worker.time.perf_counter", side_effect=[1.0, 1.125, 2.0, 2.25]),
             patch("worker.worker.time.sleep"),
-            patch("builtins.print") as print_log,
+            patch("worker.worker.log_event") as log_event,
         ):
             result = process_inference(
                 {"prompt": "new prompt", "provider": "huggingface"},
@@ -524,13 +536,25 @@ class SemanticCacheTests(unittest.TestCase):
         self.assertEqual(result["cache"], "miss")
         get_index.assert_not_called()
         add_entry.assert_not_called()
-        print_log.assert_any_call(
-            "Search engine=linear provider=huggingface",
-            flush=True,
+        log_event.assert_any_call(
+            ANY,
+            "vector_search_started",
+            request_id=None,
+            job_id=None,
+            provider="huggingface",
+            search_engine="linear",
+            candidate_count=0,
         )
-        print_log.assert_any_call(
-            "Linear search latency=125ms",
-            flush=True,
+        log_event.assert_any_call(
+            ANY,
+            "vector_search_completed",
+            request_id=None,
+            job_id=None,
+            provider="huggingface",
+            search_engine="linear",
+            candidate_count=0,
+            result_count=0,
+            duration_ms=125,
         )
         self.assertEqual(client.data["metrics:linear_search_count"], "1")
         self.assertEqual(client.data["metrics:linear_search_latency_ms_total"], "125")
@@ -546,17 +570,29 @@ class SemanticCacheTests(unittest.TestCase):
             patch("worker.worker.generate_response", return_value={"answer": "fresh"}),
             patch("worker.worker.time.perf_counter", side_effect=[1.0, 1.125, 2.0, 2.25]),
             patch("worker.worker.time.sleep"),
-            patch("builtins.print") as print_log,
+            patch("worker.worker.log_event") as log_event,
         ):
             process_inference({"prompt": "new prompt", "provider": "fake"}, client)
 
-        print_log.assert_any_call(
-            "Search engine=linear provider=fake",
-            flush=True,
+        log_event.assert_any_call(
+            ANY,
+            "vector_search_started",
+            request_id=None,
+            job_id=None,
+            provider="fake",
+            search_engine="linear",
+            candidate_count=0,
         )
-        print_log.assert_any_call(
-            "Linear search latency=125ms",
-            flush=True,
+        log_event.assert_any_call(
+            ANY,
+            "vector_search_completed",
+            request_id=None,
+            job_id=None,
+            provider="fake",
+            search_engine="linear",
+            candidate_count=0,
+            result_count=0,
+            duration_ms=125,
         )
         self.assertEqual(client.data["metrics:linear_search_count"], "1")
         self.assertEqual(client.data["metrics:linear_search_latency_ms_total"], "125")

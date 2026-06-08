@@ -1,3 +1,9 @@
+x-default-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   redis_clone:
     build:
@@ -13,6 +19,7 @@ services:
       - .:/app
       - redis_data:/app/data
     command: ["python", "-m", "redis_clone.server"]
+    logging: *default-logging
 
   api:
     build:
@@ -27,7 +34,8 @@ services:
       REDIS_PORT: 31337
     volumes:
       - .:/app
-    command: ["uvicorn", "fastapi_cache.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    command: ["uvicorn", "fastapi_cache.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload", "--no-access-log"]
+    logging: *default-logging
 
   worker:
     build:
@@ -45,6 +53,7 @@ services:
     volumes:
       - .:/app
     command: ["python", "-m", "worker.worker"]
+    logging: *default-logging
 
   prometheus:
     image: prom/prometheus:v2.55.0
@@ -55,6 +64,7 @@ services:
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus_data:/prometheus
+    logging: *default-logging
 
 volumes:
   redis_data:

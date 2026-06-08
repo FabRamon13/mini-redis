@@ -14,6 +14,7 @@ from fastapi_cache.fake_db import FAKE_DB
 from fastapi_cache.config import Settings
 from fastapi.responses import PlainTextResponse
 from typing import Literal
+from observability.logging import configure_json_logger, log_event
 
 class InferenceRequest(BaseModel):
     prompt: str = Field(
@@ -30,12 +31,7 @@ settings = Settings()
 
 
 
-logging.basicConfig(
-    level = logging.INFO,
-    format = "%(message)s"
-)
-
-logger = logging.getLogger("fastapi_cache")
+logger = configure_json_logger("api")
 
 class UserUpdate(BaseModel):
     name:str
@@ -89,20 +85,39 @@ async def request_logging_middleware(request: Request, call_next):
     """
     
     request_id = str(uuid.uuid4())
+    request.state.request_id = request_id
     start = time.perf_counter()
 
-    response = await call_next(request)
+    try:
+        response = await call_next(request)
+    except Exception as exc:
+        latency_ms = round((time.perf_counter() - start) * 1000, 2)
+        log_event(
+            logger,
+            "request_failed",
+            level=logging.ERROR,
+            request_id=request_id,
+            method=request.method,
+            path=request.url.path,
+            latency_ms=latency_ms,
+            client_host=request.client.host if request.client else None,
+            error_type=type(exc).__name__,
+            error=str(exc),
+        )
+        raise
 
     latency_ms = round((time.perf_counter() - start) * 1000, 2)
 
-    logger.info(json.dumps({
-        "request_id": request_id,
-        "method": request.method,
-        "path": request.url.path,
-        "status_code": response.status_code,
-        "latency_ms": latency_ms,
-        "client_host": request.client.host if request.client else None,
-    }))
+    log_event(
+        logger,
+        "request_completed",
+        request_id=request_id,
+        method=request.method,
+        path=request.url.path,
+        status_code=response.status_code,
+        latency_ms=latency_ms,
+        client_host=request.client.host if request.client else None,
+    )
 
     response.headers["X-Request-ID"] = request_id
 
@@ -247,6 +262,7 @@ def create_job(request:Request):
 
     job_data = {
         "id": job_id,
+        "request_id": request.state.request_id,
         "status": "queued",
         "type": "demo_task",
         "created_at": now_iso(),
@@ -260,6 +276,13 @@ def create_job(request:Request):
     }
 
     enqueue_job(cache, job_id, job_key, job_data)
+    log_event(
+        logger,
+        "job_enqueued",
+        request_id=request.state.request_id,
+        job_id=job_id,
+        job_type=job_data["type"],
+    )
 
     return {
         "job_id": job_id,
@@ -381,6 +404,7 @@ def create_inference_request(payload: InferenceRequest, request: Request):
 
     job_data = {
         "id": job_id,
+        "request_id": request.state.request_id,
         "status": "queued",
         "type": "inference",
         "prompt": payload.prompt,
@@ -396,6 +420,14 @@ def create_inference_request(payload: InferenceRequest, request: Request):
     }
 
     enqueue_job(cache, job_id, job_key, job_data)
+    log_event(
+        logger,
+        "job_enqueued",
+        request_id=request.state.request_id,
+        job_id=job_id,
+        job_type=job_data["type"],
+        provider=payload.provider,
+    )
 
     return {
         "job_id": job_id,

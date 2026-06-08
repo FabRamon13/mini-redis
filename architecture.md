@@ -539,6 +539,45 @@ Prometheus:
 GET /metrics
 ```
 
+## Structured Logging
+
+Application logs are emitted as JSON to standard output and captured by
+Docker's `json-file` logging driver with size-based rotation.
+
+Correlation follows this path:
+
+```text
+API request_id
+      ↓ persisted in job metadata
+job_id
+      ↓ claimed by
+worker_id
+      ↓
+cache, provider, completion, retry, or failure events
+```
+
+Representative events include:
+
+```text
+request_completed
+request_failed
+job_enqueued
+job_claimed
+job_started
+semantic_cache_hit
+semantic_cache_miss
+job_requeued
+job_finished
+job_failed
+stale_job_recovered
+redis_connection_lost
+redis_connection_restored
+```
+
+Claim tokens, prompts, embeddings, responses, and common secret fields are
+redacted by the shared formatter. Logs remain local to Docker for now and can
+later be shipped to CloudWatch without changing application event structure.
+
 ---
 
 # Persistence

@@ -399,6 +399,49 @@ provider_call_count
 provider_latency_ms_avg
 ```
 
+## Structured Logs
+
+The API, worker, and Hugging Face provider emit one JSON object per application
+log event to standard output. Docker captures these logs and applies size-based
+rotation.
+
+Common fields include:
+
+```text
+timestamp
+level
+service
+event
+request_id
+job_id
+worker_id
+provider
+search_engine
+cache_status
+duration_ms
+error_type
+error
+```
+
+The API stores its generated `request_id` in job metadata, allowing the same
+request to be followed from `job_enqueued` through worker processing and
+`job_finished` or `job_failed`.
+
+Sensitive values such as claim tokens, prompts, embeddings, responses, and
+secrets are excluded from structured logs.
+
+View logs locally:
+
+```bash
+docker compose logs -f api worker
+```
+
+View production logs on EC2:
+
+```bash
+docker compose -f docker-compose.prod.yml logs -f api worker
+```
+
 ---
 
 # FastAPI API

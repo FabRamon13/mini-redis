@@ -5,6 +5,7 @@ import os
 import socket
 import uuid
 import threading
+import logging
 
 
 from redis_clone.client import Client
@@ -22,6 +23,10 @@ from ai.inference import generate_response
 from worker.faiss_index import add_to_faiss
 from worker.faiss_index import get_faiss_index
 from worker.faiss_index import rebuild_faiss_indexes
+from observability.logging import configure_json_logger, log_event
+
+
+logger = configure_json_logger("worker")
 
 def load_semantic_cache_threshold(value=None):
     if value is None:
@@ -102,6 +107,8 @@ def process_demo_task(job):
     }
 
 def process_inference(job,client):
+    job_id = job.get("id")
+    request_id = job.get("request_id")
     prompt = job["prompt"]
     provider = job.get("provider", "fake")
     model_id = get_model_id(provider)
@@ -116,9 +123,14 @@ def process_inference(job,client):
     )
     search_engine = "faiss" if use_faiss else "linear"
 
-    print(
-        f"Search engine={search_engine} provider={provider}",
-        flush=True,
+    log_event(
+        logger,
+        "vector_search_started",
+        request_id=request_id,
+        job_id=job_id,
+        provider=provider,
+        search_engine=search_engine,
+        candidate_count=len(entries),
     )
 
     if use_faiss:
@@ -141,11 +153,6 @@ def process_inference(job,client):
         increment_metric(client, "metrics:faiss_search_count")
         increment_metric_by(client, "metrics:faiss_search_latency_ms_total", search_latency_ms)
 
-        print(
-            f"FAISS search latency={search_latency_ms}ms",
-            flush=True,
-        )
-
     else:
         vector_store = VectorStore(entries)
 
@@ -164,10 +171,17 @@ def process_inference(job,client):
         increment_metric(client, "metrics:linear_search_count")
         increment_metric_by(client, "metrics:linear_search_latency_ms_total", search_latency_ms)
 
-        print(
-            f"Linear search latency={search_latency_ms}ms",
-            flush=True,
-        )
+    log_event(
+        logger,
+        "vector_search_completed",
+        request_id=request_id,
+        job_id=job_id,
+        provider=provider,
+        search_engine=search_engine,
+        candidate_count=len(entries),
+        result_count=len(top_matches),
+        duration_ms=search_latency_ms,
+    )
 
     formatted_top_matches = [
         {
@@ -186,6 +200,15 @@ def process_inference(job,client):
 
     if best_match is not None and best_score >= SEMANTIC_CACHE_THRESHOLD:
         increment_metric(client,"metrics:semantic_cache_hits")
+        log_event(
+            logger,
+            "semantic_cache_hit",
+            request_id=request_id,
+            job_id=job_id,
+            provider=provider,
+            search_engine=search_engine,
+            similarity_score=round(best_score, 4),
+        )
 
         return {
             "prompt": prompt,
@@ -198,6 +221,15 @@ def process_inference(job,client):
         }
     
     increment_metric(client, "metrics:semantic_cache_misses")
+    log_event(
+        logger,
+        "semantic_cache_miss",
+        request_id=request_id,
+        job_id=job_id,
+        provider=provider,
+        search_engine=search_engine,
+        similarity_score=round(best_score, 4),
+    )
 
     time.sleep(DEMO_INFERENCE_DELAY_SECONDS)
 
@@ -209,6 +241,14 @@ def process_inference(job,client):
 
     increment_metric(client, "metrics:provider_call_count")
     increment_metric_by(client, "metrics:provider_latency_ms_total", provider_latency_ms)
+    log_event(
+        logger,
+        "provider_call_completed",
+        request_id=request_id,
+        job_id=job_id,
+        provider=provider,
+        duration_ms=provider_latency_ms,
+    )
 
     saved_entry = save_semantic_cache_entry(
         client,
@@ -248,9 +288,17 @@ def process_claimed_job(client, job_id, worker_id, claim_token="", claimed_at=No
 
     if job_raw is None:
         client.ack("processing_jobs", job_id, claim_token)
+        log_event(
+            logger,
+            "orphaned_job_removed",
+            level=logging.WARNING,
+            job_id=job_id,
+            worker_id=worker_id,
+        )
         return
 
     job = json.loads(job_raw.decode("utf-8"))
+    request_id = job.get("request_id")
     job["status"] = "running"
     job["started_at"] = now_iso()
     job["claimed_at"] = claimed_at or now_iso()
@@ -259,13 +307,29 @@ def process_claimed_job(client, job_id, worker_id, claim_token="", claimed_at=No
     job["claim_token"] = claim_token
 
     if not client.update_claim(job_id, job_key, json.dumps(job), claim_token):
+        log_event(
+            logger,
+            "job_claim_rejected",
+            level=logging.WARNING,
+            request_id=request_id,
+            job_id=job_id,
+            worker_id=worker_id,
+        )
         return
 
     stop_heartbeat=threading.Event()
     heartbeat_thread = start_claim_heartbeat(client,job,job_id,job_key,claim_token,stop_heartbeat)
-
-
-    print(f"Processing job {job_id}")
+    processing_start = time.perf_counter()
+    log_event(
+        logger,
+        "job_started",
+        request_id=request_id,
+        job_id=job_id,
+        worker_id=worker_id,
+        job_type=job.get("type"),
+        provider=job.get("provider"),
+        attempt=job.get("attempts", 0) + 1,
+    )
 
     try:
         result = process_job(job, client)
@@ -287,6 +351,24 @@ def process_claimed_job(client, job_id, worker_id, claim_token="", claimed_at=No
 
         if finished:
             increment_metric(client, "metrics:processed_jobs")
+            log_event(
+                logger,
+                "job_finished",
+                request_id=request_id,
+                job_id=job_id,
+                worker_id=worker_id,
+                job_type=job.get("type"),
+                provider=job.get("provider"),
+                cache_status=(
+                    result.get("cache")
+                    if isinstance(result, dict)
+                    else None
+                ),
+                duration_ms=round(
+                    (time.perf_counter() - processing_start) * 1000,
+                    2,
+                ),
+            )
 
     except Exception as exc:
         job["attempts"] +=1
@@ -298,7 +380,7 @@ def process_claimed_job(client, job_id, worker_id, claim_token="", claimed_at=No
             job["claim_token"] = None
             job["claimed_at"] = None
             job["started_at"] = None
-            client.requeue(
+            requeued = client.requeue(
                 "processing_jobs",
                 "jobs",
                 job_id,
@@ -306,6 +388,20 @@ def process_claimed_job(client, job_id, worker_id, claim_token="", claimed_at=No
                 json.dumps(job),
                 claim_token,
             )
+            if requeued:
+                log_event(
+                    logger,
+                    "job_requeued",
+                    level=logging.WARNING,
+                    request_id=request_id,
+                    job_id=job_id,
+                    worker_id=worker_id,
+                    job_type=job.get("type"),
+                    provider=job.get("provider"),
+                    attempt=job["attempts"],
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
             return
 
         job["status"] = "failed"
@@ -323,6 +419,24 @@ def process_claimed_job(client, job_id, worker_id, claim_token="", claimed_at=No
 
         if finished:
             increment_metric(client, "metrics:failed_jobs")
+            log_event(
+                logger,
+                "job_failed",
+                level=logging.ERROR,
+                exc_info=(type(exc), exc, exc.__traceback__),
+                request_id=request_id,
+                job_id=job_id,
+                worker_id=worker_id,
+                job_type=job.get("type"),
+                provider=job.get("provider"),
+                attempt=job["attempts"],
+                duration_ms=round(
+                    (time.perf_counter() - processing_start) * 1000,
+                    2,
+                ),
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
     finally:
         stop_heartbeat.set()
         heartbeat_thread.join(timeout=1)
@@ -353,6 +467,14 @@ def start_claim_heartbeat(client,job,job_id,job_key,claim_token,stop_event,inter
             )
 
             if not updated:
+                log_event(
+                    logger,
+                    "claim_heartbeat_failed",
+                    level=logging.WARNING,
+                    request_id=job.get("request_id"),
+                    job_id=job_id,
+                    worker_id=job.get("worker_id"),
+                )
                 break
 
     thread = threading.Thread(target=heartbeat_loop, daemon=True)
@@ -376,7 +498,12 @@ def recover_stale_processing_jobs(client, now=None):
                 else str(raw_job_id)
             )
         except UnicodeDecodeError:
-            print("Skipping processing job with invalid UTF-8 ID", flush=True)
+            log_event(
+                logger,
+                "recovery_job_skipped",
+                level=logging.WARNING,
+                reason="invalid_utf8_job_id",
+            )
             continue
 
         job_key = f"job:{job_id}"
@@ -386,16 +513,34 @@ def recover_stale_processing_jobs(client, now=None):
 
         if raw_job is None:
             client.lrem("processing_jobs", job_id)
+            log_event(
+                logger,
+                "orphaned_job_removed",
+                level=logging.WARNING,
+                job_id=job_id,
+            )
             continue
 
         try:
             job = json.loads(raw_job.decode("utf-8"))
         except (AttributeError, UnicodeDecodeError, json.JSONDecodeError):
-            print(f"Skipping processing job {job_id}: invalid metadata", flush=True)
+            log_event(
+                logger,
+                "recovery_job_skipped",
+                level=logging.WARNING,
+                job_id=job_id,
+                reason="invalid_job_metadata",
+            )
             continue
 
         if not isinstance(job, dict):
-            print(f"Skipping processing job {job_id}: invalid metadata", flush=True)
+            log_event(
+                logger,
+                "recovery_job_skipped",
+                level=logging.WARNING,
+                job_id=job_id,
+                reason="invalid_job_metadata",
+            )
             continue
 
         claimed_at = parse_iso(claim.get("claimed_at") or job.get("claimed_at"))
@@ -407,11 +552,25 @@ def recover_stale_processing_jobs(client, now=None):
                 claim.get("lease_seconds", job.get("lease_seconds", WORKER_LEASE_SECONDS)),
             )
         except ValueError:
-            print(f"Skipping processing job {job_id}: invalid lease", flush=True)
+            log_event(
+                logger,
+                "recovery_job_skipped",
+                level=logging.WARNING,
+                request_id=job.get("request_id"),
+                job_id=job_id,
+                reason="invalid_lease",
+            )
             continue
 
         if claimed_at is None:
-            print(f"Skipping processing job {job_id}: missing valid claim timestamp", flush=True)
+            log_event(
+                logger,
+                "recovery_job_skipped",
+                level=logging.WARNING,
+                request_id=job.get("request_id"),
+                job_id=job_id,
+                reason="invalid_claim_timestamp",
+            )
             continue
 
         if (now - claimed_at).total_seconds() <= lease_seconds:
@@ -435,6 +594,16 @@ def recover_stale_processing_jobs(client, now=None):
 
         if removed:
             recovered += 1
+            log_event(
+                logger,
+                "stale_job_recovered",
+                level=logging.WARNING,
+                request_id=job.get("request_id"),
+                job_id=job_id,
+                previous_worker_id=claim.get("worker_id"),
+                age_seconds=round((now - claimed_at).total_seconds(), 2),
+                lease_seconds=lease_seconds,
+            )
 
     return recovered
 
@@ -466,9 +635,9 @@ def main():
     faiss_indexes = rebuild_worker_faiss_indexes(client)
     last_recovery = time.monotonic()
 
-    print(f"Recovered {recovered} stale processing jobs", flush=True)
-    print(f"Built {faiss_indexes} FAISS indexes", flush=True)
-    print(f"Worker {worker_id} started. Waiting for jobs..", flush =True)
+    log_event(logger, "recovery_scan_completed", recovered_jobs=recovered)
+    log_event(logger, "faiss_indexes_rebuilt", index_count=faiss_indexes)
+    log_event(logger, "worker_started", worker_id=worker_id)
 
     while True:
         try:
@@ -477,7 +646,11 @@ def main():
                 last_recovery = time.monotonic()
 
                 if recovered:
-                    print(f"Recovered {recovered} stale processing jobs", flush=True)
+                    log_event(
+                        logger,
+                        "recovery_scan_completed",
+                        recovered_jobs=recovered,
+                    )
 
             claimed_at = now_iso()
             claim_token = str(uuid.uuid4())
@@ -491,18 +664,45 @@ def main():
             )
 
         except Disconnect:
-            print("Lost redis connection, reconnecting", flush=True)
+            log_event(
+                logger,
+                "redis_connection_lost",
+                level=logging.WARNING,
+                worker_id=worker_id,
+                error_type="Disconnect",
+            )
             client = connect_with_retry()
             recovered = recover_stale_processing_jobs(client)
-            rebuild_worker_faiss_indexes(client)
+            faiss_indexes = rebuild_worker_faiss_indexes(client)
+            log_event(
+                logger,
+                "redis_connection_restored",
+                worker_id=worker_id,
+                recovered_jobs=recovered,
+                faiss_index_count=faiss_indexes,
+            )
             last_recovery = time.monotonic()
             continue
         
-        except OSError:
-            print("socket error, reconnecting", flush=True)
+        except OSError as exc:
+            log_event(
+                logger,
+                "redis_connection_lost",
+                level=logging.WARNING,
+                worker_id=worker_id,
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
             client = connect_with_retry()
             recovered = recover_stale_processing_jobs(client)
-            rebuild_worker_faiss_indexes(client)
+            faiss_indexes = rebuild_worker_faiss_indexes(client)
+            log_event(
+                logger,
+                "redis_connection_restored",
+                worker_id=worker_id,
+                recovered_jobs=recovered,
+                faiss_index_count=faiss_indexes,
+            )
             last_recovery = time.monotonic()
             continue
 
@@ -511,6 +711,13 @@ def main():
             continue
 
         job_id = job_id.decode("utf-8")
+        log_event(
+            logger,
+            "job_claimed",
+            job_id=job_id,
+            worker_id=worker_id,
+            lease_seconds=WORKER_LEASE_SECONDS,
+        )
         process_claimed_job(client, job_id, worker_id, claim_token, claimed_at)
 
 def now_iso():
@@ -524,7 +731,15 @@ def connect_with_retry(max_attempts=10,delay=1):
                 port=int(os.getenv("REDIS_PORT", "31337")),
             )
         except (ConnectionRefusedError,OSError) as exc:
-            print(f"Redis not ready, retrying... attempt {attempt + 1}/{max_attempts}: {exc}")
+            log_event(
+                logger,
+                "redis_connection_retry",
+                level=logging.WARNING,
+                attempt=attempt + 1,
+                max_attempts=max_attempts,
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
             time.sleep(delay)
 
     raise RuntimeError("Could not connect to Redis clone")

@@ -29,7 +29,7 @@ jobs:
 
       - name: Compile Python files
         run: |
-          python -m compileall -q redis_clone worker fastapi_cache ai providers tests benchmarks
+          python -m compileall -q redis_clone worker fastapi_cache ai providers observability tests benchmarks
 
       - name: Run tests
         run: |

@@ -176,6 +176,30 @@ class WorkerClaimTests(unittest.TestCase):
         self.assertIn("claimed_at", job)
         self.assertIn("lease_seconds", job)
 
+    def test_completed_job_log_preserves_request_correlation(self):
+        job = self.make_job()
+        job["request_id"] = "request-1"
+        client = self.make_client(job)
+
+        with (
+            patch("worker.worker.process_job", return_value={"ok": True}),
+            patch("worker.worker.log_event") as log_event,
+        ):
+            process_claimed_job(client, "job-1", "worker-1")
+
+        finished_calls = [
+            call
+            for call in log_event.call_args_list
+            if call.args[1] == "job_finished"
+        ]
+
+        self.assertEqual(len(finished_calls), 1)
+        self.assertEqual(
+            finished_calls[0].kwargs["request_id"],
+            "request-1",
+        )
+        self.assertNotIn("claim_token", finished_calls[0].kwargs)
+
     def test_retry_requeues_and_acknowledges_current_claim(self):
         client = self.make_client(self.make_job())
 

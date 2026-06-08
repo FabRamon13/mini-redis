@@ -1,18 +1,31 @@
 from sentence_transformers import SentenceTransformer
+from observability.logging import configure_json_logger, log_event
 
 MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"
 MODEL_REVISION = "main"
 
 _model = None
+logger = configure_json_logger("huggingface_provider")
 
 def get_model():
     global _model
     
     if _model is None:
-        print("Loading HuggingFace model...")
+        log_event(
+            logger,
+            "model_loading",
+            model_id=MODEL_ID,
+            model_revision=MODEL_REVISION,
+        )
         _model = SentenceTransformer(
             MODEL_ID,
             revision = MODEL_REVISION,
+        )
+        log_event(
+            logger,
+            "model_loaded",
+            model_id=MODEL_ID,
+            model_revision=MODEL_REVISION,
         )
 
     return _model
