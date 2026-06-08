@@ -1,0 +1,28 @@
+stateDiagram-v2
+    [*] --> Queued: ENQUEUE
+    Queued --> Processing: CLAIM creates token and lease
+
+    Processing --> Processing: UPDATECLAIM heartbeat
+    Processing --> Completed: FINISH success
+    Processing --> Queued: REQUEUE retryable failure
+    Processing --> Queued: REQUEUE stale lease recovery
+    Processing --> Dead: FINISH terminal failure
+
+    Completed --> [*]
+    Dead --> [*]
+
+    note right of Processing
+        Stored in processing_jobs
+        Protected by UUID claim token
+        Lease refreshed by heartbeat
+    end note
+
+    note right of Queued
+        Stored in jobs
+        Capacity checked atomically
+    end note
+
+    note right of Dead
+        Delivery is at least once.
+        Handlers must be idempotent.
+    end note

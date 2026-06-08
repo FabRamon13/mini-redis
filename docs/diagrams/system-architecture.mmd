@@ -1,0 +1,33 @@
+flowchart TB
+    developer[Developer]
+    actions[GitHub Actions]
+    ci[CI validation]
+    client[API client]
+
+    developer -->|Push or pull request| actions
+    actions -->|Tests, compile checks, Compose validation| ci
+    actions -.->|Manual SSH deployment| host
+
+    subgraph host[AWS EC2 instance]
+        subgraph compose[Docker Compose network]
+            api[FastAPI API]
+            redis[Redis Clone]
+            worker[Worker]
+            volume[(AOF volume)]
+            faiss[Worker-local FAISS indexes]
+        end
+    end
+
+    client -->|HTTP port 8000| api
+    api -->|ENQUEUE, job reads, metrics| redis
+    worker -->|CLAIM, UPDATECLAIM, REQUEUE, FINISH| redis
+    redis -->|Append and replay mutations| volume
+
+    worker --> routing[Embedding and response routing]
+    routing --> fake[Fake implementation]
+    routing --> huggingface[Hugging Face provider]
+
+    worker -->|Linear fallback| linear[Linear vector search]
+    worker -->|Hugging Face search| faiss
+    redis -.->|Semantic entries used for startup rebuild| faiss
+    worker -->|Semantic records and metrics| redis

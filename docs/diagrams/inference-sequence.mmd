@@ -1,0 +1,46 @@
+sequenceDiagram
+    autonumber
+    actor Client
+    participant API as FastAPI
+    participant Redis as Redis Clone
+    participant Worker
+    participant Embed as Embedding Router
+    participant Search as Linear / FAISS Search
+    participant Provider as Response Provider
+
+    Client->>API: POST /inference
+    API->>Redis: ENQUEUE job metadata and job ID
+    Redis-->>API: OK
+    API-->>Client: Queued response with job ID
+
+    Worker->>Redis: CLAIM jobs -> processing_jobs
+    Redis-->>Worker: job ID, claim token, and lease
+    Worker->>Redis: UPDATECLAIM running metadata
+
+    par While processing
+        Worker->>Redis: UPDATECLAIM heartbeat
+    and Inference work
+        Worker->>Embed: Generate provider-specific embedding
+        Embed-->>Worker: Embedding and model signature
+        Worker->>Redis: Load semantic cache entries
+        Redis-->>Worker: Valid cache records
+        Worker->>Search: Top-K search for compatible signature
+        Search-->>Worker: Ranked matches and scores
+    end
+
+    alt Best score meets threshold
+        Worker->>Worker: Reuse cached response
+    else Cache miss
+        Worker->>Provider: Generate response
+        Provider-->>Worker: Provider response
+        Worker->>Redis: Save semantic cache record and index key
+        opt FAISS engine is active
+            Worker->>Search: Add saved vector to local FAISS index
+        end
+    end
+
+    Worker->>Redis: FINISH completed job
+    Client->>API: GET /jobs/{job_id}
+    API->>Redis: GET job metadata
+    Redis-->>API: Completed result
+    API-->>Client: Job result

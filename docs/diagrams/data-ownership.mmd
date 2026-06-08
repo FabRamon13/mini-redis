@@ -1,0 +1,33 @@
+flowchart LR
+    subgraph durable[Durable source of truth]
+        redis[Redis Clone memory state]
+        aof[(AOF named volume)]
+
+        redis -->|Append mutations| aof
+        aof -.->|Replay on startup| redis
+
+        jobs[Job metadata and queue state]
+        claims[Claim tokens and leases]
+        cache[Semantic cache records and index keys]
+        metrics[Atomic metrics counters]
+        ttl[TTL metadata]
+
+        redis --- jobs
+        redis --- claims
+        redis --- cache
+        redis --- metrics
+        redis --- ttl
+    end
+
+    subgraph ephemeral[Process-local and rebuildable state]
+        api[FastAPI process-local cache stats]
+        worker[Worker runtime state]
+        faiss[Worker-local FAISS indexes]
+
+        worker --> faiss
+    end
+
+    cache -.->|Rebuild on worker startup| faiss
+
+    note[FAISS accelerates search but never owns durable records]
+    faiss --- note

@@ -1,96 +1,101 @@
 # Architecture
 
-This document describes the internal architecture of the Mini Redis AI Infrastructure Platform.
+This document contains the detailed architecture for the Mini Redis AI Infrastructure Platform.
 
+For a high-level overview, see README.md.
 ---
 
 # System Overview
 
-```text
-                    Client
-                       │
-                       ▼
-                 FastAPI API
-                       │
-                       ▼
-             Redis Clone Datastore
-         ┌─────────────┼─────────────┐
-         │             │             │
-         ▼             ▼             ▼
-      KV Store     Queue State    Metrics
-                       │
-                       ▼
-                    Workers
-                       │
-                       ▼
-                Provider Router
-             ┌─────────┴─────────┐
-             ▼                   ▼
-      Fake Provider      Hugging Face
-             │                   │
-             └─────────┬─────────┘
-                       ▼
-                Semantic Cache
-                       │
-                       ▼
-                  FAISS Index
+```mermaid
+flowchart TB
+    developer[Developer]
+    actions[GitHub Actions]
+    ci[CI validation]
+    client[API client]
+
+    developer -->|Push or pull request| actions
+    actions -->|Tests, compile checks, Compose validation| ci
+    actions -.->|Manual SSH deployment| host
+
+    subgraph host[AWS EC2 instance]
+        subgraph compose[Docker Compose network]
+            api[FastAPI API]
+            redis[Redis Clone]
+            worker[Worker]
+            volume[(AOF volume)]
+            faiss[Worker-local FAISS indexes]
+        end
+    end
+
+    client -->|HTTP port 8000| api
+    api -->|ENQUEUE, job reads, metrics| redis
+    worker -->|CLAIM, UPDATECLAIM, REQUEUE, FINISH| redis
+    redis -->|Append and replay mutations| volume
+
+    worker --> routing[Embedding and response routing]
+    routing --> fake[Fake implementation]
+    routing --> huggingface[Hugging Face provider]
+
+    worker -->|Linear fallback| linear[Linear vector search]
+    worker -->|Hugging Face search| faiss
+    redis -.->|Semantic entries used for startup rebuild| faiss
+    worker -->|Semantic records and metrics| redis
 ```
 
 ---
 
 # End-to-End Request Flow
 
-The following diagram shows the complete lifecycle of an inference request.
+The following sequence shows the complete lifecycle of an inference request.
 
-```text
-Client
-  │
-POST /inference
-  │
-  ▼
-FastAPI
-  │
-ENQUEUE
-  │
-  ▼
-Redis Clone
-  │
-CLAIM
-  │
-  ▼
-Worker
-  │
-Embedding Generation
-  │
-  ▼
-FAISS Search
-  │
-Hit / Miss
-  │
-  ├────► Cache Hit
-  │           │
-  │           ▼
-  │      Cached Response
-  │
-  └────► Cache Miss
-              │
-              ▼
-      Provider Router
-              │
-              ▼
-      Hugging Face Provider
-              │
-              ▼
-      Semantic Cache Update
-              │
-              ▼
-            FINISH
-              │
-              ▼
-         Redis Clone
-              │
-              ▼
-      Client Polls Result
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Client
+    participant API as FastAPI
+    participant Redis as Redis Clone
+    participant Worker
+    participant Embed as Embedding Router
+    participant Search as Linear / FAISS Search
+    participant Provider as Response Provider
+
+    Client->>API: POST /inference
+    API->>Redis: ENQUEUE job metadata and job ID
+    Redis-->>API: OK
+    API-->>Client: Queued response with job ID
+
+    Worker->>Redis: CLAIM jobs -> processing_jobs
+    Redis-->>Worker: job ID, claim token, and lease
+    Worker->>Redis: UPDATECLAIM running metadata
+
+    par While processing
+        Worker->>Redis: UPDATECLAIM heartbeat
+    and Inference work
+        Worker->>Embed: Generate provider-specific embedding
+        Embed-->>Worker: Embedding and model signature
+        Worker->>Redis: Load semantic cache entries
+        Redis-->>Worker: Valid cache records
+        Worker->>Search: Top-K search for compatible signature
+        Search-->>Worker: Ranked matches and scores
+    end
+
+    alt Best score meets threshold
+        Worker->>Worker: Reuse cached response
+    else Cache miss
+        Worker->>Provider: Generate response
+        Provider-->>Worker: Provider response
+        Worker->>Redis: Save semantic cache record and index key
+        opt FAISS engine is active
+            Worker->>Search: Add saved vector to local FAISS index
+        end
+    end
+
+    Worker->>Redis: FINISH completed job
+    Client->>API: GET /jobs/{job_id}
+    API->>Redis: GET job metadata
+    Redis-->>API: Completed result
+    API-->>Client: Job result
 ```
 
 This flow demonstrates the interaction between the API layer, queueing system, worker infrastructure, semantic cache, vector search layer, and persistence layer.
@@ -176,22 +181,35 @@ dead_jobs
 
 ## Job Lifecycle
 
-```text
-ENQUEUE
-   │
-   ▼
-jobs
-   │
-CLAIM
-   │
-   ▼
-processing_jobs
-   │
-   ├────► FINISH
-   │
-   ├────► REQUEUE
-   │
-   └────► DEAD LETTER
+```mermaid
+stateDiagram-v2
+    [*] --> Queued: ENQUEUE
+    Queued --> Processing: CLAIM creates token and lease
+
+    Processing --> Processing: UPDATECLAIM heartbeat
+    Processing --> Completed: FINISH success
+    Processing --> Queued: REQUEUE retryable failure
+    Processing --> Queued: REQUEUE stale lease recovery
+    Processing --> Dead: FINISH terminal failure
+
+    Completed --> [*]
+    Dead --> [*]
+
+    note right of Processing
+        Stored in processing_jobs
+        Protected by UUID claim token
+        Lease refreshed by heartbeat
+    end note
+
+    note right of Queued
+        Stored in jobs
+        Capacity checked atomically
+    end note
+
+    note right of Dead
+        Delivery is at least once.
+        Handlers must be idempotent.
+    end note
 ```
 
 ---
@@ -248,8 +266,8 @@ Lease Extended
 Purpose:
 
 ```text
-Prevent duplicate execution
-Allow crash recovery
+Detect abandoned claims
+Allow stale-job recovery
 ```
 
 ---
@@ -326,6 +344,50 @@ Hit / Miss
   "response": {...}
 }
 ```
+
+---
+
+# Data Ownership
+
+```mermaid
+flowchart LR
+    subgraph durable[Durable source of truth]
+        redis[Redis Clone memory state]
+        aof[(AOF named volume)]
+
+        redis -->|Append mutations| aof
+        aof -.->|Replay on startup| redis
+
+        jobs[Job metadata and queue state]
+        claims[Claim tokens and leases]
+        cache[Semantic cache records and index keys]
+        metrics[Atomic metrics counters]
+        ttl[TTL metadata]
+
+        redis --- jobs
+        redis --- claims
+        redis --- cache
+        redis --- metrics
+        redis --- ttl
+    end
+
+    subgraph ephemeral[Process-local and rebuildable state]
+        api[FastAPI process-local cache stats]
+        worker[Worker runtime state]
+        faiss[Worker-local FAISS indexes]
+
+        worker --> faiss
+    end
+
+    cache -.->|Rebuild on worker startup| faiss
+
+    note[FAISS accelerates search but never owns durable records]
+    faiss --- note
+```
+
+Redis Clone and its AOF own durable application state. Each worker owns an
+independent FAISS index that can be discarded and rebuilt from semantic cache
+records.
 
 ---
 
@@ -526,11 +588,7 @@ Metrics
 API endpoints
 ```
 
-Current suite:
-
-```text
-162 tests passing
-```
+The project maintains a comprehensive automated test suite covering protocol parsing, persistence, queue processing, semantic caching, metrics, and API behavior.
 
 ---
 
@@ -685,4 +743,17 @@ Runs health check
 
 The deploy workflow is manual-only for now because the EC2 instance is stopped when not in use to avoid unnecessary AWS charges.
 
+---
 
+# Diagram Sources
+
+Editable Mermaid sources for the diagrams in this document are stored in
+[`docs/diagrams/`](docs/diagrams/):
+
+* [`system-architecture.mmd`](docs/diagrams/system-architecture.mmd)
+* [`inference-sequence.mmd`](docs/diagrams/inference-sequence.mmd)
+* [`queue-lifecycle.mmd`](docs/diagrams/queue-lifecycle.mmd)
+* [`data-ownership.mmd`](docs/diagrams/data-ownership.mmd)
+
+The `.mmd` files contain raw Mermaid syntax so they can be rendered by Mermaid
+CLI or exported to SVG and PNG without stripping Markdown fences.

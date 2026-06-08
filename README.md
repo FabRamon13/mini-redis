@@ -25,37 +25,45 @@ The system demonstrates concepts commonly found in backend, platform, and AI inf
 
 # Architecture
 
-```text
-                 Client
-                    │
-                    ▼
-              FastAPI API
-                    │
-                    ▼
-          Redis Clone Datastore
-      ┌─────────────┼─────────────┐
-      │             │             │
-      ▼             ▼             ▼
- Key/Value      Job Queue      Metrics
-   Store          State         Store
-                    │
-                    ▼
-                 Workers
-                    │
-                    ▼
-             Provider Router
-            ┌──────────────┐
-            │              │
-            ▼              ▼
-      Fake Provider   Hugging Face
-            │              │
-            └──────┬───────┘
-                   ▼
-             Semantic Cache
-                   │
-                   ▼
-              FAISS Index
+```mermaid
+flowchart TB
+    developer[Developer]
+    actions[GitHub Actions]
+    ci[CI validation]
+    client[API client]
+
+    developer -->|Push or pull request| actions
+    actions -->|Tests, compile checks, Compose validation| ci
+    actions -.->|Manual SSH deployment| host
+
+    subgraph host[AWS EC2 instance]
+        subgraph compose[Docker Compose network]
+            api[FastAPI API]
+            redis[Redis Clone]
+            worker[Worker]
+            volume[(AOF volume)]
+            faiss[Worker-local FAISS indexes]
+        end
+    end
+
+    client -->|HTTP port 8000| api
+    api -->|ENQUEUE, job reads, metrics| redis
+    worker -->|CLAIM, UPDATECLAIM, REQUEUE, FINISH| redis
+    redis -->|Append and replay mutations| volume
+
+    worker --> routing[Embedding and response routing]
+    routing --> fake[Fake implementation]
+    routing --> huggingface[Hugging Face provider]
+
+    worker -->|Linear fallback| linear[Linear vector search]
+    worker -->|Hugging Face search| faiss
+    redis -.->|Semantic entries used for startup rebuild| faiss
+    worker -->|Semantic records and metrics| redis
 ```
+
+For detailed system architecture, inference request flow, queue lifecycle,
+data ownership, persistence, and deployment diagrams, see
+[architecture.md](architecture.md).
 
 ---
 
@@ -311,10 +319,12 @@ Every cached embedding is scanned.
 ## FAISS Search
 
 ```text
-Approximate Nearest Neighbor Search
+Exact nearest-neighbor search using FAISS IndexFlatIP.
 ```
 
-Substantially faster retrieval at larger scales.
+Embeddings are normalized before insertion, allowing cosine similarity to be computed through inner product search.
+
+FAISS eliminates the Python-level O(n) scan while providing efficient vector retrieval and a foundation for future approximate-nearest-neighbor indexes.
 
 ### Signature Isolation
 
