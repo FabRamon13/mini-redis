@@ -54,7 +54,17 @@ services:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus_data:/prometheus
     restart: unless-stopped
+  
+  grafana:
+    image: grafana/grafana:11.3.0
+    depends_on:
+      - prometheus
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
 
 volumes:
   redis_data:
   prometheus_data:
+  grafana_data:
