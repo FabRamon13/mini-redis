@@ -689,6 +689,13 @@ failed_jobs: 0
 dead_jobs: 0
 ```
 
+### Grafana Dashboard
+
+The dashboard visualizes queue health, semantic-cache effectiveness,
+provider usage, FAISS activity, and search latency after the mixed workload.
+
+[![Grafana semantic cache dashboard](docs/diagrams/images/grafana-semantic-cache-dashboard.png)](docs/diagrams/images/grafana-semantic-cache-dashboard.png)
+
 The script also prints per-request matches and similarity scores, hit/miss
 average, p50 and p95 end-to-end latency, metric deltas, and any semantic
 paraphrases that did not meet the threshold.
