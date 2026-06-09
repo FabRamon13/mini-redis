@@ -599,7 +599,7 @@ Example successful response:
 
 ### Deployment Verification
 
-The deployed system was tested end-to-end:
+The deployed system was validated end-to-end:
 
 ```text
 POST /inference
@@ -619,29 +619,79 @@ Similar request returns cache hit
 Metrics update
 ```
 
-Example semantic cache behavior:
+---
 
-```text
-Prompt 1: "what is a cache"
-Result: cache miss
+# Semantic Cache Benchmark
 
-Prompt 2: "explain a cache"
-Result: cache hit
-Matched prompt: "what is a cache"
-Similarity score: 0.8859
+A mixed 46-request workload was executed against the deployed system using
+[`benchmarks/demo_semantic_cache.py`](benchmarks/demo_semantic_cache.py).
+
+The workload runs deterministic phases:
+
+* 6 canonical seed prompts
+* 18 semantic paraphrases
+* 12 exact repeats
+* 4 unrelated negative controls
+* 6 requests submitted as a queue burst
+
+Run it against a local or deployed API:
+
+```bash
+python3 benchmarks/demo_semantic_cache.py \
+  --base-url http://localhost:8000 \
+  --provider huggingface
 ```
 
-Metrics confirmed:
+## Recorded Result
+
+| Metric | Workload Result |
+|---|---:|
+| Total requests | 46 |
+| Completed jobs | 46 |
+| Failed jobs | 0 |
+| Dead jobs | 0 |
+| Semantic cache hits | 26 |
+| Semantic cache misses | 20 |
+| Cache hit rate | 56.5% |
+| Negative-control false positives | 0 |
+| Exact-repeat misses | 0 |
+| FAISS searches | 46 |
+| Provider calls | 20 |
+
+The result shows selective cache reuse rather than unconditional matching:
+
+* Every request completed without entering the failed or dead-job paths.
+* All exact repeats were served from cache.
+* Unrelated negative controls produced no false-positive cache hits.
+* Provider calls were avoided for 26 of 46 requests.
+* Misses included deliberate cold seeds and negative controls, plus
+  paraphrases that remained below the configured similarity threshold.
+* The final burst exercised queue submission and worker claims separately
+  from the sequential semantic checks.
+
+This is a functional demonstration workload, not a throughput or capacity
+benchmark. Results depend on the embedding model, existing cache contents,
+and `SEMANTIC_CACHE_THRESHOLD`.
+
+## Dashboard Snapshot After the Run
+
+The Grafana dashboard uses cumulative counters, so its values include the
+five requests that existed before this workload:
 
 ```text
-semantic_cache_hits: 1
-semantic_cache_misses: 1
-semantic_cache_hit_rate: 0.5
-faiss_search_count: 2
-provider_call_count: 1
+processed_jobs: 51
+semantic_cache_hits: 27
+semantic_cache_misses: 24
+semantic_cache_hit_rate: 52.9%
+faiss_search_count: 49
+provider_call_count: 24
+failed_jobs: 0
+dead_jobs: 0
 ```
 
-This proves the deployed system can process asynchronous inference jobs, use FAISS-backed semantic caching, and expose runtime observability metrics from AWS.
+The script also prints per-request matches and similarity scores, hit/miss
+average, p50 and p95 end-to-end latency, metric deltas, and any semantic
+paraphrases that did not meet the threshold.
 
 ---
 

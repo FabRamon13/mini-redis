@@ -647,6 +647,52 @@ The project maintains a comprehensive automated test suite covering protocol par
 
 ---
 
+# Semantic Cache Validation Workload
+
+The deployed semantic-cache path is validated with
+[`benchmarks/demo_semantic_cache.py`](benchmarks/demo_semantic_cache.py).
+This is an end-to-end functional workload rather than a vector-search
+microbenchmark or capacity test.
+
+```text
+Canonical seed prompts
+        ↓
+Semantic paraphrases
+        ↓
+Exact repeats
+        ↓
+Unrelated negative controls
+        ↓
+Concurrent queue burst
+```
+
+Each phase validates a different boundary:
+
+| Phase | Validates |
+|---|---|
+| Cold seeds | Cache-miss and provider-call path |
+| Semantic paraphrases | Embedding similarity and threshold behavior |
+| Exact repeats | Deterministic cache reuse |
+| Negative controls | Protection against unrelated false-positive hits |
+| Queue burst | Atomic enqueue, claim, processing, and completion |
+
+The script records each matched prompt and similarity score, separates
+semantic misses from exact-repeat failures, compares hit and miss
+end-to-end latency, and reports metric deltas instead of relying only on
+cumulative counters.
+
+A recorded 46-request deployment run completed all jobs with zero failed or
+dead jobs. It produced 26 cache hits, 20 misses, zero negative-control false
+positives, zero exact-repeat misses, 46 FAISS searches, and 20 provider
+calls. This result demonstrates selective cache reuse under the configured
+threshold; it does not establish maximum throughput or production capacity.
+
+Because Redis and Prometheus metrics are cumulative, dashboard totals after
+a run can include earlier requests. The benchmark therefore captures metrics
+before and after execution and reports the workload-specific delta.
+
+---
+
 # Design Principles
 
 1. Redis Clone is the source of truth.
