@@ -1,11 +1,78 @@
 # Architecture
 
-This document contains the detailed architecture for the Mini Redis AI Infrastructure Platform.
+This document describes the system boundaries, ownership model, guarantees,
+failure behavior, and tradeoffs of the Mini Redis AI Infrastructure Platform.
 
-For a high-level overview, see README.md.
+For a high-level project overview and quick start, see [README.md](README.md).
+
 ---
 
-# System Overview
+## Contents
+
+- [Design Goals and Non-Goals](#design-goals-and-non-goals)
+- [System Invariants](#system-invariants)
+- [System Overview](#system-overview)
+- [End-to-End Request Flow](#end-to-end-request-flow)
+- [Service Responsibilities](#service-responsibilities)
+- [Queue Architecture](#queue-architecture)
+- [Concurrency and Atomicity](#concurrency-and-atomicity)
+- [Semantic Cache Architecture](#semantic-cache-architecture)
+- [Data Ownership](#data-ownership)
+- [Vector Search](#vector-search)
+- [Metrics and Logging Architecture](#metrics-and-logging-architecture)
+- [Persistence and Recovery](#persistence-and-recovery)
+- [Architectural Tradeoffs](#architectural-tradeoffs)
+- [Deployment and Trust Boundaries](#deployment-and-trust-boundaries)
+- [Failure Modes](#failure-modes)
+- [Validation Strategy](#validation-strategy)
+- [Diagram Sources](#diagram-sources)
+
+---
+
+## Design Goals and Non-Goals
+
+### Goals
+
+- Preserve application state through append-only persistence.
+- Recover in-flight work after worker crashes or lease expiration.
+- Keep Redis Clone as the authoritative state store.
+- Treat FAISS indexes as rebuildable acceleration structures.
+- Make queue, cache, provider, and worker behavior observable.
+- Isolate heavy ML dependencies to the worker service.
+- Keep deployment simple enough to inspect and operate on one EC2 instance.
+
+### Non-Goals
+
+- Full Redis protocol or command compatibility
+- A production Redis replacement
+- Exactly-once job delivery
+- Distributed consensus
+- Multi-node high availability
+- Multi-region deployment
+- Zero-downtime deployment
+
+---
+
+## System Invariants
+
+The architecture relies on these invariants:
+
+1. Redis Clone is authoritative in memory, and commands successfully appended
+   to the AOF are the durable recovery source.
+2. FAISS indexes never own durable application data.
+3. Workers may restart and rebuild local FAISS indexes from Redis records.
+4. Mutations to claimed jobs require the current claim token; stale or missing
+   tokens cannot update, requeue, acknowledge, or finish a claim.
+5. Expired claims are recoverable through stale-claim scans.
+6. Queue delivery is at least once; job handlers must tolerate retries.
+7. Metrics counters are updated through atomic Redis Clone commands.
+8. Semantic cache entries never cross provider, model ID, model revision, or
+   embedding-dimension boundaries.
+9. API and Redis Clone processes do not import worker-only ML dependencies.
+
+---
+
+## System Overview
 
 ```mermaid
 flowchart TB
@@ -45,7 +112,7 @@ flowchart TB
 
 ---
 
-# End-to-End Request Flow
+## End-to-End Request Flow
 
 The following sequence shows the complete lifecycle of an inference request.
 
@@ -102,74 +169,24 @@ This flow demonstrates the interaction between the API layer, queueing system, w
 
 ---
 
-# Service Responsibilities
+## Service Responsibilities
 
-## FastAPI
+| Service | Responsibilities | State ownership |
+|---|---|---|
+| FastAPI | Validate requests, atomically enqueue jobs, expose status, health, and metrics | No authoritative application state |
+| Redis Clone | RESP parsing, shared state, TTLs, atomic queue transitions, counters, AOF persistence | Durable source of truth |
+| Worker | Claims, leases, recovery, embeddings, vector search, provider calls, cache writes, metrics | Runtime state and rebuildable FAISS indexes |
+| Prometheus | Scrape and retain exported metrics | Named metrics volume |
+| Grafana | Query Prometheus and render dashboards | Named dashboard volume |
 
-Responsible for:
-
-* Request validation
-* Job creation
-* Job lookup
-* Metrics exposure
-* Health checks
-
-FastAPI does not perform inference directly.
-
-All inference work is delegated to workers.
+FastAPI never performs inference directly. Workers are disposable except for
+their process-local FAISS projections, which are reconstructed from Redis.
 
 ---
 
-## Redis Clone
+## Queue Architecture
 
-Redis Clone is the durable source of truth.
-
-Stores:
-
-```text
-Jobs
-Queue state
-Semantic cache metadata
-Metrics
-TTL data
-Application state
-```
-
-Responsibilities:
-
-```text
-TCP networking
-RESP parsing
-Persistence
-Atomic queue operations
-Concurrency control
-```
-
----
-
-## Worker
-
-Workers perform asynchronous processing.
-
-Responsibilities:
-
-```text
-Claim jobs
-Maintain leases
-Send heartbeats
-Recover stale jobs
-Execute inference
-Update semantic cache
-Update metrics
-```
-
-Workers are intentionally stateless except for FAISS indexes.
-
----
-
-# Queue Architecture
-
-## Queues
+### Queues
 
 ```text
 jobs
@@ -179,7 +196,7 @@ dead_jobs
 
 ---
 
-## Job Lifecycle
+### Job Lifecycle
 
 ```mermaid
 stateDiagram-v2
@@ -214,7 +231,7 @@ stateDiagram-v2
 
 ---
 
-## Claim Tokens
+### Claim Tokens
 
 Every claimed job receives:
 
@@ -249,88 +266,63 @@ Only the worker possessing the matching claim token may modify the claim.
 
 ---
 
-## Worker Leases
+### Worker Leases
 
-Workers claim jobs with a lease.
-
-```text
-Claim
- ↓
-Lease Starts
- ↓
-Heartbeat
- ↓
-Lease Extended
-```
-
-Purpose:
-
-```text
-Detect abandoned claims
-Allow stale-job recovery
-```
+Claims include a time-based lease. Workers periodically refresh the claim and
+job metadata with `UPDATECLAIM`. If a worker crashes or stops heartbeating, a
+recovery scan can identify the expired claim and make the job available again.
 
 ---
 
-## Recovery Flow
+### Recovery Flow
 
-```text
-Worker Crash
-      ↓
-Lease Expires
-      ↓
-Recovery Scan
-      ↓
-REQUEUE
-      ↓
-Available Again
-```
+If a worker crashes while processing a job, the claim remains in
+`processing_jobs` until its lease expires. A recovery scan validates the stale
+claim token, resets the job metadata, and atomically moves the job back to
+`jobs`. Another worker may then claim it.
 
-Delivery semantics:
-
-```text
-At Least Once
-```
+This provides at-least-once delivery. A worker can continue running after its
+lease expires, so duplicate execution remains possible and handlers must be
+idempotent.
 
 ---
 
-# Semantic Cache Architecture
+## Concurrency and Atomicity
 
-## Goal
+The TCP server accepts multiple clients through a bounded gevent connection
+pool. Mutating commands protect shared in-memory dictionaries and lists with a
+server-wide reentrant lock. Compound queue commands perform their related state
+changes and AOF append while holding that lock.
 
-Reduce repeated inference cost.
+| Command | Protected state transition |
+|---|---|
+| `ENQUEUE` | Check capacity, store job metadata, and push the job ID |
+| `CLAIM` | Move a job to processing and create token/lease metadata |
+| `UPDATECLAIM` | Validate the token and refresh job and claim metadata |
+| `REQUEUE` | Validate the token, update metadata, and move the job to `jobs` |
+| `FINISH` | Validate the token, persist terminal metadata, remove the claim, and optionally push to `dead_jobs` |
+| `ACK` | Validate the token and remove processing/claim state |
+| `INCR` / `INCRBY` | Read, modify, persist, and return a counter |
 
-Instead of:
+The Redis client also serializes each socket request/response cycle with a
+reentrant lock so concurrent API threads cannot interleave RESP frames on one
+connection.
 
-```text
-Prompt equality
-```
-
-Use:
-
-```text
-Embedding similarity
-```
-
----
-
-## Cache Flow
-
-```text
-Prompt
-   ↓
-Embedding Generation
-   ↓
-Vector Search
-   ↓
-Similarity Threshold
-   ↓
-Hit / Miss
-```
+These guarantees prevent partially applied in-memory queue transitions and
+lost counter updates. They do not provide distributed transactions,
+exactly-once execution, or atomicity across multiple client commands.
 
 ---
 
-## Cache Entry Structure
+## Semantic Cache Architecture
+
+The semantic cache reuses responses based on embedding similarity rather than
+exact prompt equality. A worker embeds the query, searches only compatible
+entries, and accepts the best result when its score meets
+`SEMANTIC_CACHE_THRESHOLD`. A miss invokes the provider and persists a new
+record.
+
+### Cache Entry
 
 ```json
 {
@@ -345,9 +337,14 @@ Hit / Miss
 }
 ```
 
+Entries are validated before use. Provider, model ID, model revision, and
+embedding dimensions define compatibility; malformed, stale, or incompatible
+records are skipped. UUID keys avoid collisions, duplicate prompt/model entries
+are not rewritten, and retention pruning bounds indexed growth.
+
 ---
 
-# Data Ownership
+## Data Ownership
 
 ```mermaid
 flowchart LR
@@ -372,7 +369,7 @@ flowchart LR
     end
 
     subgraph ephemeral[Process-local and rebuildable state]
-        api[FastAPI process-local cache stats]
+        api[FastAPI runtime and Redis client connection]
         worker[Worker runtime state]
         faiss[Worker-local FAISS indexes]
 
@@ -391,64 +388,17 @@ records.
 
 ---
 
-# Vector Search
+## Vector Search
 
-## Linear Search
+The worker supports two exact search paths:
 
-Implementation:
+| Engine | Implementation | Role |
+|---|---|---|
+| Linear | Python cosine-similarity scan, `O(n)` | Baseline, testing, fallback |
+| FAISS | Normalized vectors in `IndexFlatIP` | Worker-local accelerated Top-K search |
 
-```text
-Cosine similarity against every embedding.
-```
-
-Complexity:
-
-```text
-O(n)
-```
-
-Used for:
-
-```text
-Testing
-Validation
-Fallback behavior
-```
-
----
-
-## FAISS Search
-
-Implementation:
-
-```text
-IndexFlatIP
-```
-
-Embeddings are normalized before insertion.
-
-Similarity:
-
-```text
-Cosine similarity
-```
-
-via normalized inner product.
-
----
-
-# FAISS Signature Isolation
-
-Separate indexes exist for:
-
-```text
-provider
-model_id
-model_revision
-embedding_dimensions
-```
-
-Signature:
+Normalized inner product is used as cosine similarity. Separate FAISS indexes
+are keyed by this signature:
 
 ```python
 (
@@ -459,49 +409,40 @@ Signature:
 )
 ```
 
-This prevents incompatible embedding spaces from mixing.
+This prevents incompatible embedding spaces from mixing. At startup, the
+worker reads `semantic_cache:index`, validates each record, groups entries by
+signature, and rebuilds the corresponding indexes. Losing FAISS state does not
+lose semantic-cache data.
 
 ---
 
-# FAISS Rebuild Strategy
+### FAISS Consistency Model
 
-Redis remains the source of truth.
+Each worker owns an independent in-memory FAISS index. On startup, a worker
+builds indexes from semantic cache records visible in Redis. After a cache
+miss, that worker adds the newly saved entry to its own index.
 
-FAISS stores only search structures.
+With multiple workers, indexes can temporarily diverge because local FAISS
+updates are not broadcast between processes. Redis remains authoritative; a
+restart or explicit rebuild repairs a worker's local projection.
 
-Startup:
+Semantic cache persistence is a multi-command workflow:
 
-```text
-Worker Startup
-      ↓
-Read semantic_cache:index
-      ↓
-Load Entries
-      ↓
-Validate Signatures
-      ↓
-Build FAISS Indexes
-```
+1. Store `semantic_cache:<uuid>`.
+2. Push the key into `semantic_cache:index`.
+3. Prune records beyond the configured limit.
+4. Add the vector to the local FAISS index.
 
-If FAISS is lost:
-
-```text
-Delete FAISS
-      ↓
-Restart Worker
-      ↓
-Automatic Rebuild
-```
-
-No semantic cache data is lost.
+These steps are not one transaction. A crash between the record write and
+index-list update can leave an unindexed record. A failure after Redis writes
+but before FAISS insertion leaves durable data that can be recovered during a
+later worker rebuild.
 
 ---
 
-# Metrics Architecture
+## Metrics and Logging Architecture
 
-Metrics are stored inside Redis Clone.
-
-The observability path is:
+Metrics counters are stored in Redis Clone and exported by FastAPI:
 
 ```text
 Redis-backed counters
@@ -513,54 +454,19 @@ Prometheus
 Grafana dashboard
 ```
 
-Structured JSON logs complement the metrics with `request_id` and `job_id`
-correlation across API and worker events. Docker captures and rotates these
-logs using the `json-file` driver.
+`INCR` records event counts and `INCRBY` records integer latency totals.
+FastAPI derives averages and cache-hit rate from those cumulative values.
+Queue depths are read directly from list lengths.
 
-Counters:
+| Endpoint | Format | Consumer |
+|---|---|---|
+| `GET /jobs/metrics` | JSON | Humans and API clients |
+| `GET /metrics` | Prometheus text | Prometheus and Grafana |
 
-```text
-processed_jobs
-failed_jobs
+### Structured Logging
 
-semantic_cache_hits
-semantic_cache_misses
-
-faiss_search_count
-linear_search_count
-
-provider_call_count
-```
-
-Atomic operations:
-
-```text
-INCR
-INCRBY
-```
-
----
-
-## Metrics Endpoints
-
-JSON:
-
-```http
-GET /jobs/metrics
-```
-
-Prometheus:
-
-```http
-GET /metrics
-```
-
-## Structured Logging
-
-Application logs are emitted as JSON to standard output and captured by
-Docker's `json-file` logging driver with size-based rotation.
-
-Correlation follows this path:
+API, worker, and Hugging Face provider events are emitted as JSON to standard
+output and captured by Docker with size-based rotation. Correlation follows:
 
 ```text
 API request_id
@@ -572,23 +478,9 @@ worker_id
 cache, provider, completion, retry, or failure events
 ```
 
-Representative events include:
-
-```text
-request_completed
-request_failed
-job_enqueued
-job_claimed
-job_started
-semantic_cache_hit
-semantic_cache_miss
-job_requeued
-job_finished
-job_failed
-stale_job_recovered
-redis_connection_lost
-redis_connection_restored
-```
+Representative events include request completion/failure, enqueue, claim,
+worker start, semantic hit/miss, provider completion, requeue, terminal
+completion/failure, stale recovery, and Redis reconnects.
 
 Claim tokens, prompts, embeddings, responses, and common secret fields are
 redacted by the shared formatter. Logs remain local to Docker for now and can
@@ -596,116 +488,60 @@ later be shipped to CloudWatch without changing application event structure.
 
 ---
 
-# Persistence
+## Persistence and Recovery
 
-Persistence uses Append Only Files.
+Redis Clone persists mutating operations as RESP command arrays in an
+append-only file stored on a named Docker volume. RESP framing preserves
+arbitrary bytes and spaces without relying on ad hoc command parsing.
 
-Every mutating operation:
+Persisted operations include key/value and list mutations, absolute expiration
+timestamps, queue transitions, claim heartbeats, terminal job updates, and
+metrics counters.
 
-```text
-SET
-DELETE
-MSET
-LPUSH
-CLAIM
-FINISH
-REQUEUE
-INCR
-INCRBY
-...
-```
+### Write Path
 
-is appended to disk.
+Each mutating handler:
 
-Startup:
+1. Validates arguments before changing shared state.
+2. Acquires the server's reentrant lock.
+3. Applies the in-memory transition.
+4. Appends the corresponding command to the AOF before releasing the lock.
 
-```text
-Replay AOF
-      ↓
-Reconstruct State
-```
+The implementation opens the AOF in append mode for each command but does not
+call `fsync`. It reconstructs commands successfully written before restart,
+but does not claim power-loss durability for data still buffered by the
+operating system or storage device.
 
----
+### Replay
 
-# Testing Strategy
+At startup, the server reads RESP commands sequentially and dispatches them
+through normal command handlers. Replay mode suppresses AOF writes so
+restoration does not duplicate records.
 
-Coverage areas:
+If replay reaches a malformed or crash-truncated frame, it stops before
+applying that command. Valid commands before the damaged frame remain restored;
+commands after the first damaged frame are not replayed.
 
-```text
-Protocol parsing
-Persistence
-TTL
-Queue operations
-Lease recovery
-Semantic cache
-FAISS rebuild
-Metrics
-API endpoints
-```
+### TTL Semantics
 
-The project maintains a comprehensive automated test suite covering protocol parsing, persistence, queue processing, semantic caching, metrics, and API behavior.
+`SET ... EX` is persisted as a value write followed by `EXPIREAT` with the
+original absolute timestamp. Restart therefore preserves the remaining
+lifetime instead of resetting the relative TTL. Already expired keys are not
+restored.
 
----
+### Persistence Limits
 
-# Semantic Cache Validation Workload
-
-The deployed semantic-cache path is validated with
-[`benchmarks/demo_semantic_cache.py`](benchmarks/demo_semantic_cache.py).
-This is an end-to-end functional workload rather than a vector-search
-microbenchmark or capacity test.
-
-```text
-Canonical seed prompts
-        ↓
-Semantic paraphrases
-        ↓
-Exact repeats
-        ↓
-Unrelated negative controls
-        ↓
-Concurrent queue burst
-```
-
-Each phase validates a different boundary:
-
-| Phase | Validates |
-|---|---|
-| Cold seeds | Cache-miss and provider-call path |
-| Semantic paraphrases | Embedding similarity and threshold behavior |
-| Exact repeats | Deterministic cache reuse |
-| Negative controls | Protection against unrelated false-positive hits |
-| Queue burst | Atomic enqueue, claim, processing, and completion |
-
-The script records each matched prompt and similarity score, separates
-semantic misses from exact-repeat failures, compares hit and miss
-end-to-end latency, and reports metric deltas instead of relying only on
-cumulative counters.
-
-A recorded 46-request deployment run completed all jobs with zero failed or
-dead jobs. It produced 26 cache hits, 20 misses, zero negative-control false
-positives, zero exact-repeat misses, 46 FAISS searches, and 20 provider
-calls. This result demonstrates selective cache reuse under the configured
-threshold; it does not establish maximum throughput or production capacity.
-
-Because Redis and Prometheus metrics are cumulative, dashboard totals after
-a run can include earlier requests. The benchmark therefore captures metrics
-before and after execution and reports the workload-specific delta.
+- AOF rewrite and compaction are not implemented.
+- There are no snapshots, replication, checksummed segments, or automatic
+  backup verification.
+- In-memory mutation and AOF append are protected by one process lock but do
+  not form a storage transaction with rollback.
+- Replay terminates at the first malformed frame instead of attempting to
+  discover an uncertain later command boundary.
 
 ---
 
-# Design Principles
-
-1. Redis Clone is the source of truth.
-2. Workers are disposable.
-3. FAISS is rebuildable.
-4. Queue operations are token protected.
-5. Metrics use atomic counters.
-6. Semantic cache is provider/model isolated.
-7. Recovery is automatic after worker failure.
-
----
-
-# Architectural Tradeoffs
+## Architectural Tradeoffs
 
 The platform intentionally favors simplicity and observability over maximum scalability.
 
@@ -723,130 +559,184 @@ These decisions reduce system complexity while preserving durability, recoverabi
 
 ---
 
-# AWS Deployment Architecture
+## Deployment and Trust Boundaries
 
 The deployed version runs on a single AWS EC2 instance.
 
-```text
-Developer Machine
-      │
-      │ SSH
-      ▼
-AWS EC2 Instance
-      │
-      ├── Docker Compose
-      │
-      ├── FastAPI Container
-      │
-      ├── Redis Clone Container
-      │
-      └── Worker Container
+```mermaid
+flowchart TB
+    external[External client]
+    github[GitHub Actions]
+    ssh[Developer over SSH]
+
+    subgraph ec2[AWS EC2 instance]
+        api[FastAPI :8000]
+        redis[Redis Clone :31337]
+        worker[Worker]
+        prometheus[Prometheus :9090]
+        grafana[Grafana :3000]
+        redisVolume[(Redis AOF volume)]
+        metricsVolume[(Prometheus volume)]
+        grafanaVolume[(Grafana volume)]
+
+        api --> redis
+        worker --> redis
+        prometheus -->|Scrape /metrics| api
+        grafana --> prometheus
+        redis --> redisVolume
+        prometheus --> metricsVolume
+        grafana --> grafanaVolume
+    end
+
+    external -->|Allowed security group source on port 8000| api
+    github -.->|SSH deployment| ec2
+    ssh -.->|SSH and local forwarding| ec2
 ```
 
-## EC2 Runtime
+### EC2 Runtime
 
-The EC2 instance runs:
+The host runs Ubuntu Server 24.04 LTS, Docker, and Docker Compose. Application
+services are defined in `docker-compose.prod.yml`.
 
-```text
-Ubuntu Server 24.04 LTS
-Docker
-Docker Compose
-```
+### Network Boundary
 
-The application is deployed using:
+Only FastAPI port `8000` is published externally. Redis Clone port `31337`
+remains inside the Docker network. Prometheus `9090` and Grafana `3000` bind to
+the EC2 loopback interface and are accessed through SSH port forwarding.
 
-```bash
-docker-compose -f docker-compose.prod.yml up -d
-```
+SSH access is controlled by the EC2 security group. Deployment credentials are
+stored as GitHub Actions secrets and are not committed to the repository.
 
-## Network Boundary
+### Container and Dependency Boundary
 
-Only the FastAPI service is exposed externally.
+| Container | Responsibility |
+|---|---|
+| FastAPI | HTTP validation, enqueue, job reads, health, metrics |
+| Redis Clone | TCP datastore, queue state, AOF, counters |
+| Worker | Claims, embeddings, provider execution, FAISS, cache updates |
+| Prometheus | Scrapes and retains `/metrics` |
+| Grafana | Queries Prometheus and stores dashboard state |
 
-```text
-Internet / Developer IP
-          │
-          ▼
-EC2 Security Group
-          │
-          ▼
-Port 8000
-          │
-          ▼
-FastAPI Container
-```
+The worker owns Hugging Face, CPU-only PyTorch, sentence-transformer, and FAISS
+dependencies. API and Redis images remain lightweight and do not import worker
+modules during startup.
 
-Redis Clone is not exposed publicly.
+Claim tokens behave like authorization credentials for in-flight jobs. They
+are validated by Redis Clone commands and excluded from structured logs.
 
-```text
-Redis Clone Port 31337
-Internal Docker network only
-```
-
-This keeps the datastore accessible to the API and worker containers while preventing direct external access.
-
-## Container Boundary
-
-```text
-FastAPI Container
-  - HTTP API
-  - Job creation
-  - Metrics endpoints
-
-Redis Clone Container
-  - TCP datastore
-  - Queue state
-  - AOF persistence
-  - Metrics counters
-
-Worker Container
-  - Job processing
-  - Hugging Face embeddings
-  - FAISS indexes
-  - Semantic cache updates
-```
-
-The worker owns the heavy ML dependencies. The API and Redis containers remain lightweight.
-
-## Deployment Flow
-
-Manual deployment flow:
+### Deployment Flow
 
 ```text
-SSH into EC2
+Manual GitHub Actions dispatch
       ↓
-git pull origin main
+SSH to EC2 using repository secrets
       ↓
-docker-compose -f docker-compose.prod.yml down
+git pull --ff-only origin main
       ↓
-docker-compose -f docker-compose.prod.yml build
+compose down → build → up -d
       ↓
-docker-compose -f docker-compose.prod.yml up -d
-      ↓
-curl /health
+poll /health and print logs on failure
 ```
 
-GitHub Actions deployment flow:
-
-```text
-Run Deploy workflow
-      ↓
-GitHub Actions connects to EC2 over SSH
-      ↓
-Pulls latest main branch
-      ↓
-Rebuilds Docker images
-      ↓
-Restarts containers
-      ↓
-Runs health check
-```
-
-The deploy workflow is manual-only for now because the EC2 instance is stopped when not in use to avoid unnecessary AWS charges.
+The deploy workflow is manual-only. It stops the current stack before building
+and starting the replacement, then polls `/health`. This is operationally
+simple but not zero downtime.
 
 ---
 
-# Diagram Sources
+## Failure Modes
+
+### Worker Crash
+
+If a worker crashes after claiming a job, the job remains in
+`processing_jobs` until its lease expires. A stale-claim scan can requeue it so
+another worker processes it. The original worker may have produced side
+effects before crashing, so duplicate execution remains possible.
+
+### Redis Clone Restart
+
+Redis Clone reconstructs state by replaying commands successfully appended to
+the AOF. This includes key/value and list state, queue transitions, claim
+metadata, semantic cache records, absolute TTL metadata, and metrics counters.
+A malformed final frame is ignored together with anything after it.
+
+### FAISS Index Loss or Divergence
+
+FAISS indexes are process-local projections. A restarting worker reloads
+compatible Redis records and rebuilds each provider/model/revision/dimension
+index. Multiple live workers can temporarily hold different index contents;
+Redis remains the repair source.
+
+### Semantic Cache Partial Write
+
+Saving the entry record, pushing its key into `semantic_cache:index`, pruning,
+and adding it to FAISS are separate steps. A failure can leave an orphaned
+record or a durable record missing from the local FAISS index. Cache misses
+remain safe because the provider can still execute, and a worker rebuild can
+repair Redis-backed FAISS state. Automatic orphan reconciliation is not yet
+implemented.
+
+### Provider Failure
+
+A retryable provider or processing exception causes the current claim to be
+requeued with updated attempt metadata. After the configured attempt limit,
+`FINISH` stores terminal failure metadata and moves the job to `dead_jobs`.
+
+### API or Redis Connectivity Failure
+
+FastAPI holds no authoritative local copy of job state. If Redis Clone is
+unavailable, health becomes degraded and queue/status operations fail rather
+than silently accepting work that cannot be persisted. Workers log connection
+loss and retry connection establishment.
+
+### Deployment Failure
+
+The workflow runs `compose down` before image build and startup. A build,
+configuration, or health-check failure can therefore leave the service
+unavailable. The workflow prints container status and logs, but automatic
+rollback and zero-downtime replacement are not implemented.
+
+---
+
+## Validation Strategy
+
+Automated coverage includes:
+
+```text
+RESP parsing and request limits
+AOF replay and truncated-record handling
+TTL persistence
+Atomic queue transitions
+Claim tokens, leases, heartbeats, and recovery
+Semantic cache validation and pruning
+FAISS isolation, rebuilds, and nearest-neighbor behavior
+Metrics and structured logging
+API request validation and job creation
+```
+
+The deployed semantic-cache path is also exercised with
+[`benchmarks/demo_semantic_cache.py`](benchmarks/demo_semantic_cache.py). This
+is an end-to-end functional workload, not a capacity benchmark.
+
+| Phase | Validates |
+|---|---|
+| Cold seeds | Cache-miss and provider-call path |
+| Semantic paraphrases | Embedding similarity and threshold behavior |
+| Exact repeats | Deterministic cache reuse |
+| Negative controls | Protection against unrelated false-positive hits |
+| Queue burst | Atomic enqueue, claim, processing, and completion |
+
+A recorded 46-request run completed every job with 26 cache hits, 20 misses,
+zero negative-control false positives, zero exact-repeat misses, and zero failed
+or dead jobs. The script captures before/after metric deltas because Redis and
+Prometheus counters are cumulative.
+
+This validates functional behavior and recovery boundaries. It does not
+establish maximum throughput, multi-host scalability, or power-loss durability.
+
+---
+
+## Diagram Sources
 
 Editable Mermaid sources for the diagrams in this document are stored in
 [`docs/diagrams/`](docs/diagrams/):
