@@ -306,12 +306,20 @@ def get_job_metrics(request: Request):
     provider_call_count = cache.get("metrics:provider_call_count")
     provider_call_count = decode_counter(provider_call_count)
 
-    faiss_search_latency_total = cache.get("metrics:faiss_search_latency_ms_total")
-    linear_search_latency_total = cache.get("metrics:linear_search_latency_ms_total")
+    faiss_search_latency_ms_legacy = cache.get("metrics:faiss_search_latency_ms_total")
+    linear_search_latency_ms_legacy = cache.get("metrics:linear_search_latency_ms_total")
+    faiss_search_latency_us_total = cache.get("metrics:faiss_search_latency_us_total")
+    linear_search_latency_us_total = cache.get("metrics:linear_search_latency_us_total")
     provider_latency_total = cache.get("metrics:provider_latency_ms_total")
 
-    faiss_search_latency_ms_total = decode_counter(faiss_search_latency_total)
-    linear_search_latency_ms_total = decode_counter(linear_search_latency_total)
+    faiss_search_latency_ms_total = (
+        decode_counter(faiss_search_latency_ms_legacy)
+        + decode_counter(faiss_search_latency_us_total) / 1000
+    )
+    linear_search_latency_ms_total = (
+        decode_counter(linear_search_latency_ms_legacy)
+        + decode_counter(linear_search_latency_us_total) / 1000
+    )
     provider_latency_ms_total = decode_counter(provider_latency_total)
     faiss_search_latency_ms_avg = (
         faiss_search_latency_ms_total / faiss_search_count
@@ -353,11 +361,11 @@ def get_job_metrics(request: Request):
         "semantic_cache_misses": semantic_misses_count,
         "semantic_cache_hit_rate": round(semantic_hit_rate,4),
         "faiss_search_count": faiss_search_count,
-        "faiss_search_latency_ms_total": faiss_search_latency_ms_total,
-        "faiss_search_latency_ms_avg": round(faiss_search_latency_ms_avg, 2),
+        "faiss_search_latency_ms_total": round(faiss_search_latency_ms_total, 4),
+        "faiss_search_latency_ms_avg": round(faiss_search_latency_ms_avg, 4),
         "linear_search_count": linear_search_count,
-        "linear_search_latency_ms_total": linear_search_latency_ms_total,
-        "linear_search_latency_ms_avg": round(linear_search_latency_ms_avg, 2),
+        "linear_search_latency_ms_total": round(linear_search_latency_ms_total, 4),
+        "linear_search_latency_ms_avg": round(linear_search_latency_ms_avg, 4),
         "provider_call_count": provider_call_count,
         "provider_latency_ms_total": provider_latency_ms_total,
         "provider_latency_ms_avg": round(provider_latency_ms_avg, 2),

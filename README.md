@@ -361,7 +361,15 @@ If FAISS indexes are lost, workers automatically rebuild them.
 
 # Metrics & Observability
 
-The platform exposes both JSON and Prometheus-style metrics.
+The observability stack includes:
+
+* Prometheus-compatible metrics at `GET /metrics`
+* A Grafana dashboard for queue health and semantic cache behavior
+* Structured JSON application logs
+* `request_id` and `job_id` correlation across the API and worker
+* Size-based Docker log rotation
+
+Human-readable JSON metrics remain available at `GET /jobs/metrics`.
 
 ## JSON Metrics
 
@@ -374,6 +382,8 @@ GET /jobs/metrics
 ```http
 GET /metrics
 ```
+
+Prometheus scrapes this endpoint and supplies the Grafana dashboard.
 
 Tracked metrics include:
 
@@ -673,7 +683,7 @@ http://localhost:9090
 * Semantic cache insertion is not fully atomic
 * FAISS indexes are worker-local and rebuilt on startup
 * Single-worker deployment has not been validated at scale
-* Prometheus scraping is bundled, but alerting and external dashboards are not configured
+* Prometheus and Grafana are bundled, but alerting is not configured
 * No automated deployment rollback mechanism
 * AWS deployment currently runs on a single EC2 instance
 * Deployments require rebuilding Docker images on the target server

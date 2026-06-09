@@ -38,6 +38,8 @@ class MetricsCache:
             "metrics:linear_search_count": b"7",
             "metrics:faiss_search_latency_ms_total": b"25",
             "metrics:linear_search_latency_ms_total": b"35",
+            "metrics:faiss_search_latency_us_total": b"625",
+            "metrics:linear_search_latency_us_total": b"875",
             "metrics:provider_call_count": b"4",
             "metrics:provider_latency_ms_total": b"44",
         }
@@ -66,6 +68,8 @@ class CorruptMetricsCache(MetricsCache):
             "metrics:linear_search_count": b"bad",
             "metrics:faiss_search_latency_ms_total": b"bad",
             "metrics:linear_search_latency_ms_total": b"bad",
+            "metrics:faiss_search_latency_us_total": b"bad",
+            "metrics:linear_search_latency_us_total": b"bad",
             "metrics:provider_call_count": b"bad",
             "metrics:provider_latency_ms_total": b"bad",
         }
@@ -132,11 +136,11 @@ class ApiEnqueueTests(unittest.TestCase):
         self.assertEqual(metrics["semantic_cache_hits"], 2)
         self.assertEqual(metrics["semantic_cache_misses"], 1)
         self.assertEqual(metrics["faiss_search_count"], 5)
-        self.assertEqual(metrics["faiss_search_latency_ms_total"], 25)
-        self.assertEqual(metrics["faiss_search_latency_ms_avg"], 5.0)
+        self.assertEqual(metrics["faiss_search_latency_ms_total"], 25.625)
+        self.assertEqual(metrics["faiss_search_latency_ms_avg"], 5.125)
         self.assertEqual(metrics["linear_search_count"], 7)
-        self.assertEqual(metrics["linear_search_latency_ms_total"], 35)
-        self.assertEqual(metrics["linear_search_latency_ms_avg"], 5.0)
+        self.assertEqual(metrics["linear_search_latency_ms_total"], 35.875)
+        self.assertEqual(metrics["linear_search_latency_ms_avg"], 5.125)
         self.assertEqual(metrics["provider_call_count"], 4)
         self.assertEqual(metrics["provider_latency_ms_total"], 44)
         self.assertEqual(metrics["provider_latency_ms_avg"], 11.0)
@@ -149,7 +153,7 @@ class ApiEnqueueTests(unittest.TestCase):
         self.assertIn("mini_redis_queued_jobs 4", response)
         self.assertIn("mini_redis_processing_jobs 2", response)
         self.assertIn("mini_redis_semantic_cache_hits 2", response)
-        self.assertIn("mini_redis_faiss_search_latency_ms_avg 5.0", response)
+        self.assertIn("mini_redis_faiss_search_latency_ms_avg 5.125", response)
         self.assertIn("mini_redis_provider_latency_ms_avg 11.0", response)
         self.assertTrue(response.endswith("\n"))
 

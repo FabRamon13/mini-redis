@@ -501,6 +501,22 @@ No semantic cache data is lost.
 
 Metrics are stored inside Redis Clone.
 
+The observability path is:
+
+```text
+Redis-backed counters
+        ↓
+FastAPI /metrics
+        ↓
+Prometheus
+        ↓
+Grafana dashboard
+```
+
+Structured JSON logs complement the metrics with `request_id` and `job_id`
+correlation across API and worker events. Docker captures and rotates these
+logs using the `json-file` driver.
+
 Counters:
 
 ```text

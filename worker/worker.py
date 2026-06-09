@@ -148,10 +148,16 @@ def process_inference(job,client):
             embedding=vector,
             k=3,
         )
-        search_latency_ms = int((time.perf_counter() - search_start) * 1000)
+        search_latency_us = round(
+            (time.perf_counter() - search_start) * 1_000_000
+        )
 
         increment_metric(client, "metrics:faiss_search_count")
-        increment_metric_by(client, "metrics:faiss_search_latency_ms_total", search_latency_ms)
+        increment_metric_by(
+            client,
+            "metrics:faiss_search_latency_us_total",
+            search_latency_us,
+        )
 
     else:
         vector_store = VectorStore(entries)
@@ -166,10 +172,18 @@ def process_inference(job,client):
             k=3,
         )
 
-        search_latency_ms = int((time.perf_counter() - search_start) * 1000)
+        search_latency_us = round(
+            (time.perf_counter() - search_start) * 1_000_000
+        )
 
         increment_metric(client, "metrics:linear_search_count")
-        increment_metric_by(client, "metrics:linear_search_latency_ms_total", search_latency_ms)
+        increment_metric_by(
+            client,
+            "metrics:linear_search_latency_us_total",
+            search_latency_us,
+        )
+
+    search_latency_ms = search_latency_us / 1000
 
     log_event(
         logger,
@@ -180,7 +194,7 @@ def process_inference(job,client):
         search_engine=search_engine,
         candidate_count=len(entries),
         result_count=len(top_matches),
-        duration_ms=search_latency_ms,
+        duration_ms=round(search_latency_ms, 4),
     )
 
     formatted_top_matches = [

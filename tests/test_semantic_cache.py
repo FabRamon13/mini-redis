@@ -478,7 +478,7 @@ class SemanticCacheTests(unittest.TestCase):
             patch("worker.worker.generate_response", return_value={"answer": "fresh"}),
             patch("worker.worker.get_faiss_index", return_value=faiss_store) as get_index,
             patch("worker.worker.add_to_faiss") as add_entry,
-            patch("worker.worker.time.perf_counter", side_effect=[1.0, 1.125, 2.0, 2.25]),
+            patch("worker.worker.time.perf_counter", side_effect=[1.0, 1.0005, 2.0, 2.25]),
             patch("worker.worker.time.sleep"),
             patch("worker.worker.log_event") as log_event,
         ):
@@ -508,10 +508,10 @@ class SemanticCacheTests(unittest.TestCase):
             search_engine="faiss",
             candidate_count=0,
             result_count=0,
-            duration_ms=125,
+            duration_ms=0.5,
         )
         self.assertEqual(client.data["metrics:faiss_search_count"], "1")
-        self.assertEqual(client.data["metrics:faiss_search_latency_ms_total"], "125")
+        self.assertEqual(client.data["metrics:faiss_search_latency_us_total"], "500")
         self.assertEqual(client.data["metrics:provider_call_count"], "1")
         self.assertEqual(client.data["metrics:provider_latency_ms_total"], "250")
 
@@ -557,7 +557,7 @@ class SemanticCacheTests(unittest.TestCase):
             duration_ms=125,
         )
         self.assertEqual(client.data["metrics:linear_search_count"], "1")
-        self.assertEqual(client.data["metrics:linear_search_latency_ms_total"], "125")
+        self.assertEqual(client.data["metrics:linear_search_latency_us_total"], "125000")
         self.assertEqual(client.data["metrics:provider_call_count"], "1")
         self.assertEqual(client.data["metrics:provider_latency_ms_total"], "250")
 
@@ -595,7 +595,7 @@ class SemanticCacheTests(unittest.TestCase):
             duration_ms=125,
         )
         self.assertEqual(client.data["metrics:linear_search_count"], "1")
-        self.assertEqual(client.data["metrics:linear_search_latency_ms_total"], "125")
+        self.assertEqual(client.data["metrics:linear_search_latency_us_total"], "125000")
         self.assertEqual(client.data["metrics:provider_call_count"], "1")
         self.assertEqual(client.data["metrics:provider_latency_ms_total"], "250")
 
